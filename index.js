@@ -21,11 +21,14 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    const sql = neon(env.DATABASE_URL);
     const url = new URL(request.url);
     const parts = url.pathname.split("/").filter(Boolean); // ["api","nc", ...]
 
     try {
+      if (!env.DATABASE_URL) {
+        return json({ error: "Falta el secreto DATABASE_URL en este Worker" }, 500);
+      }
+      const sql = neon(env.DATABASE_URL);
       // GET /api/nc/proximo-numero
       if (request.method === "GET" && parts[1] === "nc" && parts[2] === "proximo-numero") {
         const rows = await sql`SELECT COALESCE(MAX(numero), 924) + 1 AS siguiente FROM nc`;
