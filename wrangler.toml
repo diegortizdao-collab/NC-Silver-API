@@ -1,3 +1,8 @@
 name = "nc-silver-api"
 main = "index.js"
 compatibility_date = "2024-09-23"
+
+[[secrets_store_secrets]]
+binding = "DATABASE_URL"
+store_id = "016a0d22aadd49bfab8f219be3c83f25"
+secret_name = "Database_url"
