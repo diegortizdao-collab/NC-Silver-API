@@ -26,9 +26,10 @@ export default {
 
     try {
       if (!env.DATABASE_URL) {
-        return json({ error: "Falta el secreto DATABASE_URL en este Worker" }, 500);
+        return json({ error: "Falta el binding DATABASE_URL en este Worker" }, 500);
       }
-      const sql = neon(env.DATABASE_URL);
+      const connectionString = await env.DATABASE_URL.get();
+      const sql = neon(connectionString);
       // GET /api/nc/proximo-numero
       if (request.method === "GET" && parts[1] === "nc" && parts[2] === "proximo-numero") {
         const rows = await sql`SELECT COALESCE(MAX(numero), 924) + 1 AS siguiente FROM nc`;
@@ -144,4 +145,4 @@ export default {
       return json({ error: err.message }, 500);
     }
   },
-}; 
+};
