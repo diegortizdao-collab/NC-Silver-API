@@ -1,0 +1,11 @@
+{
+  "name": "nc-silver-api",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@neondatabase/serverless": "^0.10.4"
+  },
+  "devDependencies": {
+    "wrangler": "^3.78.0"
+  }
+}
