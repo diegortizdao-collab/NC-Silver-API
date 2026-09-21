@@ -30,6 +30,18 @@ export default {
       }
       const connectionString = await env.DATABASE_URL.get();
       const sql = neon(connectionString);
+      // GET /api/nc/operarios -> detalle de operarios/productos involucrados por NC (para RRHH)
+      if (request.method === "GET" && parts[1] === "nc" && parts[2] === "operarios") {
+        const rows = await sql`
+          SELECT o.nc_numero, o.operario, o.producto, o.maquina,
+                 n.fecha_produccion, n.numero_original, n.tipo_nc_historico, n.tipo
+          FROM nc_operarios o
+          JOIN nc n ON n.numero = o.nc_numero
+          ORDER BY n.fecha_produccion DESC
+        `;
+        return json(rows);
+      }
+
       // GET /api/nc/proximo-numero
       if (request.method === "GET" && parts[1] === "nc" && parts[2] === "proximo-numero") {
         const rows = await sql`SELECT COALESCE(MAX(numero), 924) + 1 AS siguiente FROM nc`;
