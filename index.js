@@ -30,21 +30,44 @@ export default {
       }
       const connectionString = await env.DATABASE_URL.get();
       const sql = neon(connectionString);
-      // GET /api/nc/operarios -> detalle de operarios/productos involucrados por NC (para RRHH)
+      // GET /api/nc/operarios -> detalle de operarios/productos involucrados por NC
+      // (para RRHH y para la exportación Q.11 en formato oficial). Solo trae las NC
+      // migradas que se repartieron entre varios operarios (nc.operario queda NULL
+      // en esos casos); las NC nuevas de un solo operario ya vienen completas en
+      // GET /api/nc con su propio campo "operario".
       if (request.method === "GET" && parts[1] === "nc" && parts[2] === "operarios") {
         const rows = await sql`
           SELECT o.nc_numero, o.operario, o.producto, o.maquina,
-                 n.fecha_produccion, n.numero_original, n.tipo_nc_historico, n.tipo
+                 n.fecha_produccion, n.numero_original, n.tipo_nc_historico, n.tipo,
+                 n.categoria, n.cliente, n.cantidad_piezas, n.descripcion,
+                 n.con_devolucion, n.cargado_por_apellido, n.cargado_por_nombre,
+                 n.operario_legajo,
+                 a.estado, a.causa_raiz, a.costo_asociado
           FROM nc_operarios o
           JOIN nc n ON n.numero = o.nc_numero
+          LEFT JOIN nc_analisis a ON a.nc_numero = o.nc_numero
           ORDER BY n.fecha_produccion DESC
         `;
         return json(rows);
       }
 
       // GET /api/nc/proximo-numero
+      // Importante: las NC migradas del histórico usan un "numero" interno sintético
+      // (100001+) para no chocar entre sí, y guardan el número real de Q.11 en
+      // "numero_original". El próximo correlativo tiene que seguir la numeración
+      // REAL (numero_original si existe, sino numero), nunca los sintéticos.
       if (request.method === "GET" && parts[1] === "nc" && parts[2] === "proximo-numero") {
-        const rows = await sql`SELECT COALESCE(MAX(numero), 924) + 1 AS siguiente FROM nc`;
+        const rows = await sql`
+          SELECT COALESCE(
+            MAX(
+              CASE
+                WHEN COALESCE(numero_original, numero) < 100000
+                THEN COALESCE(numero_original, numero)
+              END
+            ), 921
+          ) + 1 AS siguiente
+          FROM nc
+        `;
         return json({ siguiente: rows[0].siguiente });
       }
 
@@ -77,12 +100,14 @@ export default {
             numero, tipo, categoria, cliente, producto, descripcion,
             fecha_produccion, operario, maquina, oti, cantidad_piezas,
             disposicion, fecha_programada, cumplido, fecha_cumplimiento,
-            requiere_accion, creado_por
+            requiere_accion, creado_por,
+            cargado_por_apellido, cargado_por_nombre, operario_legajo
           ) VALUES (
             ${b.numero}, ${b.tipo}, ${b.categoria}, ${b.cliente || null}, ${b.producto}, ${b.descripcion},
             ${b.fechaProduccion || null}, ${b.operario || null}, ${b.maquina || null}, ${b.oti || null}, ${b.cantidadPiezas || null},
             ${b.disposicion}, ${b.fechaProgramada || null}, ${b.cumplido || null}, ${b.fechaCumplimiento || null},
-            ${b.requiereAccion || null}, ${b.usuario || null}
+            ${b.requiereAccion || null}, ${b.usuario || null},
+            ${b.cargadoPorApellido || null}, ${b.cargadoPorNombre || null}, ${b.operarioLegajo || null}
           )
           RETURNING *
         `;
@@ -106,13 +131,13 @@ export default {
             modificar_documento, documento_detalle, accion_descripcion, responsable,
             fecha_programada_accion, fecha_verif_cumplimiento, evidencia_cumplimiento,
             fecha_verif_eficacia, evidencia_eficacia, no_requiere_notificacion, estado,
-            actualizado_en
+            costo_asociado, actualizado_en
           ) VALUES (
             ${numero}, ${b.porque1 || null}, ${b.porque2 || null}, ${b.porque3 || null}, ${b.porque4 || null}, ${b.porque5 || null}, ${b.causaRaiz || null},
             ${b.modificarDocumento || null}, ${b.documentoDetalle || null}, ${b.accionDescripcion || null}, ${b.responsable || null},
             ${b.fechaProgramadaAccion || null}, ${b.fechaVerifCumplimiento || null}, ${b.evidenciaCumplimiento || null},
             ${b.fechaVerifEficacia || null}, ${b.evidenciaEficacia || null}, ${b.noRequiereNotificacion || false}, ${b.estado || "Abierta"},
-            now()
+            ${b.costoAsociado || null}, now()
           )
           ON CONFLICT (nc_numero) DO UPDATE SET
             porque1 = EXCLUDED.porque1, porque2 = EXCLUDED.porque2, porque3 = EXCLUDED.porque3,
@@ -126,6 +151,7 @@ export default {
             evidencia_eficacia = EXCLUDED.evidencia_eficacia,
             no_requiere_notificacion = EXCLUDED.no_requiere_notificacion,
             estado = EXCLUDED.estado,
+            costo_asociado = EXCLUDED.costo_asociado,
             actualizado_en = now()
           RETURNING *
         `;
