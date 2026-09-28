@@ -51,6 +51,56 @@ export default {
         return json(rows);
       }
 
+      // PUT /api/nc/:numero/documento -> guarda (o pisa) el snapshot Q.21 en R2.
+      // El cliente manda el .docx ya armado como binario. Si la NC ya está
+      // "congelada" (se cerró y se generó su versión final), rechaza el pisado
+      // para que el registro final quede intacto para la auditoría.
+      // ?congelar=1 marca esta subida como la definitiva (llamado cuando el
+      // Bloque 2 pasa a estado "Cerrada").
+      if (request.method === "PUT" && parts[1] === "nc" && parts[2] && parts[3] === "documento") {
+        const numero = Number(parts[2]);
+        if (!env.NC_DOCS) {
+          return json({ error: "Falta el binding NC_DOCS (bucket R2) en este Worker" }, 500);
+        }
+        const [ncRow] = await sql`SELECT documento_congelado FROM nc WHERE numero = ${numero}`;
+        if (!ncRow) return json({ error: "NC no encontrada" }, 404);
+        if (ncRow.documento_congelado) {
+          return json({ error: "El documento de esta NC ya está congelado (cerrada) y no se puede sobrescribir." }, 409);
+        }
+        const bytes = await request.arrayBuffer();
+        const key = `nc/Q21_NC_${numero}.docx`;
+        await env.NC_DOCS.put(key, bytes, {
+          httpMetadata: {
+            contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          },
+        });
+        const congelar = url.searchParams.get("congelar") === "1";
+        await sql`
+          UPDATE nc SET documento_generado_en = now(), documento_congelado = ${congelar}
+          WHERE numero = ${numero}
+        `;
+        return json({ ok: true, congelado: congelar });
+      }
+
+      // GET /api/nc/:numero/documento -> descarga el snapshot Q.21 guardado en R2.
+      // Va ANTES de la ruta genérica GET /api/nc/:numero (que no filtra parts[3]).
+      if (request.method === "GET" && parts[1] === "nc" && parts[2] && parts[3] === "documento") {
+        const numero = Number(parts[2]);
+        if (!env.NC_DOCS) {
+          return json({ error: "Falta el binding NC_DOCS (bucket R2) en este Worker" }, 500);
+        }
+        const key = `nc/Q21_NC_${numero}.docx`;
+        const obj = await env.NC_DOCS.get(key);
+        if (!obj) return json({ error: "Todavía no se generó el documento para esta NC" }, 404);
+        return new Response(obj.body, {
+          headers: {
+            "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "Content-Disposition": `attachment; filename="Q21_NC_${numero}.docx"`,
+            ...CORS_HEADERS,
+          },
+        });
+      }
+
       // GET /api/nc/proximo-numero
       // Importante: las NC migradas del histórico usan un "numero" interno sintético
       // (100001+) para no chocar entre sí, y guardan el número real de Q.11 en
