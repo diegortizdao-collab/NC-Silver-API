@@ -122,7 +122,7 @@ export default {
       if (!env.DATABASE_URL) {
         return json({ error: "Falta el binding DATABASE_URL en este Worker" }, 500);
       }
-      const connectionString = await env.DATABASE_URL.get();
+      const connectionString = await secreto(env.DATABASE_URL); // secreto común (o binding de Secrets Store, si existiera)
       const sql = neon(connectionString);
       // GET /api/nc/operarios -> detalle de operarios/productos involucrados por NC
       // (para RRHH y para la exportación Q.11 en formato oficial). Solo trae las NC
