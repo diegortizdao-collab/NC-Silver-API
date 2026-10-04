@@ -22,6 +22,20 @@ const MAILS_AUTORIZADOS = new Set([
   "controldeproducion@silverindustrial.com.ar", // sic: así lo informó el usuario; confirmar ortografía
 ]);
 const TOKEN_HORAS = 12;
+
+// Tipos de informe con numeración propia (PR.05 Rev. 6). El número interno es offset+n para no chocar
+// con las NC; el número real queda en numero_original (mismo criterio que el histórico del Q.11).
+//  - OM (Oportunidades de mejora): se cargan a mano las históricas (1 a 244) y las nuevas siguen desde la 245.
+//  - Hallazgos de auditoría: serie nueva desde 2026 (los 5 hallazgos viejos del Q.11 quedan con la numeración de NC).
+const TIPO_OM = "Op. de mejora";
+const TIPO_HA = "Hallazgo de auditoría";
+const SERIES = {
+  om: { tipo: TIPO_OM, offset: 200000, base: 244 }, // el próximo nunca baja de la 245
+  ha: { tipo: TIPO_HA, offset: 300000, base: 0 },
+};
+const serieDeTipo = (tipo) => (tipo === TIPO_OM ? SERIES.om : tipo === TIPO_HA ? SERIES.ha : null);
+const NC_MAX_INTERNO = 200000; // los números internos de NC (incl. históricas 100001+) quedan por debajo
+const CLASES_NC = ["Defectos x Control de Calidad", "Reclamos de Clientes", "Hallazgos de Auditoría", "Proveedores"];
 const enc = new TextEncoder();
 
 const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -187,6 +201,14 @@ export default {
       // "numero_original". El próximo correlativo tiene que seguir la numeración
       // REAL (numero_original si existe, sino numero), nunca los sintéticos.
       if (request.method === "GET" && parts[1] === "nc" && parts[2] === "proximo-numero") {
+        const serieQ = SERIES[url.searchParams.get("tipo")];
+        if (serieQ) {
+          const [sg] = await sql`
+            SELECT GREATEST(COALESCE(MAX(numero_original), 0), ${serieQ.base}) + 1 AS siguiente
+            FROM nc WHERE numero >= ${serieQ.offset} AND numero < ${serieQ.offset + 100000}
+          `;
+          return json({ siguiente: sg.siguiente, numeroInterno: serieQ.offset + sg.siguiente });
+        }
         const rows = await sql`
           SELECT COALESCE(
             MAX(
@@ -197,6 +219,7 @@ export default {
             ), 921
           ) + 1 AS siguiente
           FROM nc
+          WHERE numero < ${NC_MAX_INTERNO}
         `;
         return json({ siguiente: rows[0].siguiente });
       }
@@ -225,27 +248,76 @@ export default {
       // POST /api/nc -> crea una NC nueva (Bloque 1)
       if (request.method === "POST" && parts[1] === "nc" && !parts[2]) {
         const b = await request.json();
+        // Clasificación (solo NC/hallazgos; las OM no se clasifican) y devolución efectiva (solo reclamos)
+        const serie = serieDeTipo(b.tipo);
+        const esOM = b.tipo === TIPO_OM;
+        const clase = esOM ? null : b.clasificacion || (b.tipo === TIPO_HA ? "Hallazgos de Auditoría" : null);
+        if (clase && !CLASES_NC.includes(clase)) return json({ error: "Clasificación inválida" }, 400);
+        const conDev = clase === "Reclamos de Clientes" && typeof b.conDevolucion === "boolean" ? b.conDevolucion : null;
+        let numero = b.numero;
+        let numeroOriginal = null;
+        if (serie) {
+          // Serie propia: el cliente puede indicar el número (carga manual de OM históricas); si no, el próximo.
+          let n = Number.isInteger(b.numeroSerie) && b.numeroSerie > 0 && b.numeroSerie < 100000 ? b.numeroSerie : null;
+          if (n === null) {
+            const [sg] = await sql`
+              SELECT GREATEST(COALESCE(MAX(numero_original), 0), ${serie.base}) + 1 AS siguiente
+              FROM nc WHERE numero >= ${serie.offset} AND numero < ${serie.offset + 100000}
+            `;
+            n = sg.siguiente;
+          }
+          const [dup] = await sql`SELECT numero FROM nc WHERE numero = ${serie.offset + n}`;
+          if (dup) return json({ error: `Ya existe el ${esOM ? "OM" : "hallazgo"} Nº ${n}` }, 409);
+          numeroOriginal = n;
+          numero = serie.offset + n;
+        }
         const [row] = await sql`
           INSERT INTO nc (
-            numero, tipo, categoria, cliente, producto, descripcion,
+            numero, numero_original, tipo, categoria, cliente, producto, descripcion,
             fecha_produccion, operario, maquina, oti, cantidad_piezas,
             disposicion, fecha_programada, cumplido, fecha_cumplimiento,
             requiere_accion, creado_por,
-            cargado_por_apellido, cargado_por_nombre, operario_legajo
+            cargado_por_apellido, cargado_por_nombre, operario_legajo,
+            clasificacion, con_devolucion
           ) VALUES (
-            ${b.numero}, ${b.tipo}, ${b.categoria}, ${b.cliente || null}, ${b.producto}, ${b.descripcion},
+            ${numero}, ${numeroOriginal}, ${b.tipo}, ${b.categoria}, ${b.cliente || null}, ${b.producto}, ${b.descripcion},
             ${b.fechaProduccion || null}, ${b.operario || null}, ${b.maquina || null}, ${b.oti || null}, ${b.cantidadPiezas || null},
             ${b.disposicion}, ${b.fechaProgramada || null}, ${b.cumplido || null}, ${b.fechaCumplimiento || null},
             ${b.requiereAccion || null}, ${b.usuario || null},
-            ${b.cargadoPorApellido || null}, ${b.cargadoPorNombre || null}, ${b.operarioLegajo || null}
+            ${b.cargadoPorApellido || null}, ${b.cargadoPorNombre || null}, ${b.operarioLegajo || null},
+            ${clase}, ${conDev}
           )
           RETURNING *
         `;
         await sql`
           INSERT INTO nc_historial (nc_numero, campo, valor_anterior, valor_nuevo, usuario)
-          VALUES (${b.numero}, 'creación', NULL, 'NC creada', ${b.usuario || null})
+          VALUES (${numero}, 'creación', NULL, ${esOM ? "OM creada" : b.tipo === TIPO_HA ? "Hallazgo creado" : "NC creada"}, ${b.usuario || usuarioToken})
         `;
         return json(row, 201);
+      }
+
+      // PUT /api/nc/:numero/clasificacion {clasificacion, conDevolucion} -> Calidad confirma/corrige la clase
+      if (request.method === "PUT" && parts[1] === "nc" && parts[2] && parts[3] === "clasificacion") {
+        const numero = Number(parts[2]);
+        const b = await request.json();
+        if (!CLASES_NC.includes(b.clasificacion)) return json({ error: "Clasificación inválida" }, 400);
+        const conDev = b.clasificacion === "Reclamos de Clientes" && typeof b.conDevolucion === "boolean" ? b.conDevolucion : null;
+        if (b.clasificacion === "Reclamos de Clientes" && conDev === null) return json({ error: "Indicá si hubo devolución efectiva" }, 400);
+        const [previo] = await sql`SELECT clasificacion, con_devolucion, tipo FROM nc WHERE numero = ${numero}`;
+        if (!previo) return json({ error: "NC no encontrada" }, 404);
+        if (previo.tipo === TIPO_OM) return json({ error: "Las oportunidades de mejora no se clasifican" }, 400);
+        const [row] = await sql`
+          UPDATE nc SET clasificacion = ${b.clasificacion}, con_devolucion = ${conDev}, actualizado_en = now()
+          WHERE numero = ${numero} RETURNING *
+        `;
+        await sql`
+          INSERT INTO nc_historial (nc_numero, campo, valor_anterior, valor_nuevo, usuario)
+          VALUES (${numero}, 'clasificación',
+                  ${(previo.clasificacion || "—") + (previo.con_devolucion === null ? "" : previo.con_devolucion ? " (con devolución)" : " (sin devolución)")},
+                  ${b.clasificacion + (conDev === null ? "" : conDev ? " (con devolución)" : " (sin devolución)")},
+                  ${b.usuario || usuarioToken})
+        `;
+        return json(row);
       }
 
       // PUT /api/nc/:numero/analisis -> crea o actualiza el Bloque 2
