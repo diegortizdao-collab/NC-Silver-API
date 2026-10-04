@@ -1,12 +1,70 @@
 import { neon } from "@neondatabase/serverless";
 
-// Cambiá esto por el dominio real de tu app cuando lo tengas confirmado.
-// Por ahora dejamos "*" (cualquier origen) para no trabarte mientras probamos.
+// Solo las apps publicadas en GitHub Pages pueden llamar a la API desde el navegador.
+const ALLOWED_ORIGIN = "https://diegortizdao-collab.github.io";
 const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
   "Access-Control-Allow-Methods": "GET,POST,PUT,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers": "Content-Type,Authorization",
+  "Vary": "Origin",
 };
+
+// ---------------------------------------------------------------------------
+// Acceso: lista blanca de mails + contraseña compartida (secreto del Worker).
+// La contraseña NUNCA va en el código ni en el repo: wrangler secret put APP_PASSWORD
+// El token se firma con AUTH_SECRET (wrangler secret put AUTH_SECRET, texto largo al azar).
+// ---------------------------------------------------------------------------
+const MAILS_AUTORIZADOS = new Set([
+  "diegortizdao@gmail.com",
+  "gestioncalidad@silverindustrial.com.ar",
+  "dortiz@escorial.com.ar",
+  "controlcalidad@silverindustrial.com.ar",
+  "controldeproducion@silverindustrial.com.ar", // sic: así lo informó el usuario; confirmar ortografía
+]);
+const TOKEN_HORAS = 12;
+const enc = new TextEncoder();
+
+const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const b64uStr = (s) => b64u(enc.encode(s));
+const unb64uStr = (s) => new TextDecoder().decode(Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0)));
+
+async function secreto(binding) {
+  if (!binding) return null;
+  return typeof binding === "string" ? binding : await binding.get();
+}
+
+async function hmac(clave, texto) {
+  const k = await crypto.subtle.importKey("raw", enc.encode(clave), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return b64u(await crypto.subtle.sign("HMAC", k, enc.encode(texto)));
+}
+
+async function iguales(a, b) {
+  // comparación en tiempo constante vía hash
+  const [ha, hb] = await Promise.all([crypto.subtle.digest("SHA-256", enc.encode(a)), crypto.subtle.digest("SHA-256", enc.encode(b))]);
+  const x = new Uint8Array(ha), y = new Uint8Array(hb);
+  let d = 0;
+  for (let i = 0; i < x.length; i++) d |= x[i] ^ y[i];
+  return d === 0;
+}
+
+async function emitirToken(email, authSecret) {
+  const payload = b64uStr(JSON.stringify({ email, exp: Date.now() + TOKEN_HORAS * 3600 * 1000 }));
+  return `${payload}.${await hmac(authSecret, payload)}`;
+}
+
+async function verificarToken(token, authSecret) {
+  if (!token || !authSecret) return null;
+  const [payload, firma] = token.split(".");
+  if (!payload || !firma) return null;
+  if (!(await iguales(firma, await hmac(authSecret, payload)))) return null;
+  try {
+    const d = JSON.parse(unb64uStr(payload));
+    if (!d.exp || d.exp < Date.now() || !MAILS_AUTORIZADOS.has(d.email)) return null;
+    return d.email;
+  } catch {
+    return null;
+  }
+}
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -23,6 +81,28 @@ export default {
 
     const url = new URL(request.url);
     const parts = url.pathname.split("/").filter(Boolean); // ["api","nc", ...]
+
+    // POST /api/login {email, password} -> {token, email, expira}
+    if (request.method === "POST" && parts[0] === "api" && parts[1] === "login") {
+      const authSecret = await secreto(env.AUTH_SECRET);
+      const appPassword = await secreto(env.APP_PASSWORD);
+      if (!authSecret || !appPassword) return json({ error: "Acceso no configurado en el Worker (faltan APP_PASSWORD / AUTH_SECRET)" }, 500);
+      let b = {};
+      try { b = await request.json(); } catch {}
+      const email = String(b.email || "").trim().toLowerCase();
+      const okMail = MAILS_AUTORIZADOS.has(email);
+      const okPass = await iguales(String(b.password || ""), appPassword);
+      if (!okMail || !okPass) {
+        await new Promise((r) => setTimeout(r, 600)); // frena la fuerza bruta
+        return json({ error: "Mail o contraseña incorrectos" }, 401);
+      }
+      return json({ token: await emitirToken(email, authSecret), email, expira: Date.now() + TOKEN_HORAS * 3600 * 1000 });
+    }
+
+    // Todo lo demás exige un token válido
+    const authSecret = await secreto(env.AUTH_SECRET);
+    const usuarioToken = await verificarToken((request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, ""), authSecret);
+    if (!usuarioToken) return json({ error: "No autorizado" }, 401);
 
     try {
       if (!env.DATABASE_URL) {
