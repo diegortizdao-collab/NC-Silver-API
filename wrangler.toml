@@ -2,10 +2,8 @@ name = "nc-silver-api"
 main = "index.js"
 compatibility_date = "2024-09-23"
 
-[[secrets_store_secrets]]
-binding = "DATABASE_URL"
-store_id = "016a0d22aadd49bfab8f219be3c83f25"
-secret_name = "DATABASE_URL"
+# DATABASE_URL ahora es un secreto común del Worker (Settings > Variables and Secrets > Secret).
+# Los secretos comunes sobreviven a cada deploy desde GitHub; el binding de Secrets Store se perdía.
 
 [[r2_buckets]]
 binding = "NC_DOCS"
