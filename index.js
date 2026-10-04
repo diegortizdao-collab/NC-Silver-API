@@ -23,12 +23,18 @@ const MAILS_AUTORIZADOS = new Set([
 ]);
 const TOKEN_HORAS = 12;
 
-// Tipos de informe con numeración propia. Las OM (Oportunidades de mejora) tienen su
-// correlativo (la última histórica es la 244) y usan un número interno 200000+n para no
-// chocar con las NC; el número real queda en numero_original (mismo criterio que el histórico del Q.11).
+// Tipos de informe con numeración propia (PR.05 Rev. 6). El número interno es offset+n para no chocar
+// con las NC; el número real queda en numero_original (mismo criterio que el histórico del Q.11).
+//  - OM (Oportunidades de mejora): se cargan a mano las históricas (1 a 244) y las nuevas siguen desde la 245.
+//  - Hallazgos de auditoría: serie nueva desde 2026 (los 5 hallazgos viejos del Q.11 quedan con la numeración de NC).
 const TIPO_OM = "Op. de mejora";
-const OM_OFFSET = 200000;
-const OM_ULTIMA_HISTORICA = 244;
+const TIPO_HA = "Hallazgo de auditoría";
+const SERIES = {
+  om: { tipo: TIPO_OM, offset: 200000, base: 244 }, // el próximo nunca baja de la 245
+  ha: { tipo: TIPO_HA, offset: 300000, base: 0 },
+};
+const serieDeTipo = (tipo) => (tipo === TIPO_OM ? SERIES.om : tipo === TIPO_HA ? SERIES.ha : null);
+const NC_MAX_INTERNO = 200000; // los números internos de NC (incl. históricas 100001+) quedan por debajo
 const CLASES_NC = ["Defectos x Control de Calidad", "Reclamos de Clientes", "Hallazgos de Auditoría", "Proveedores"];
 const enc = new TextEncoder();
 
@@ -195,12 +201,13 @@ export default {
       // "numero_original". El próximo correlativo tiene que seguir la numeración
       // REAL (numero_original si existe, sino numero), nunca los sintéticos.
       if (request.method === "GET" && parts[1] === "nc" && parts[2] === "proximo-numero") {
-        if (url.searchParams.get("tipo") === "om") {
-          const [om] = await sql`
-            SELECT COALESCE(MAX(numero_original), ${OM_ULTIMA_HISTORICA}) + 1 AS siguiente
-            FROM nc WHERE tipo = ${TIPO_OM}
+        const serieQ = SERIES[url.searchParams.get("tipo")];
+        if (serieQ) {
+          const [sg] = await sql`
+            SELECT GREATEST(COALESCE(MAX(numero_original), 0), ${serieQ.base}) + 1 AS siguiente
+            FROM nc WHERE numero >= ${serieQ.offset} AND numero < ${serieQ.offset + 100000}
           `;
-          return json({ siguiente: om.siguiente, numeroInterno: OM_OFFSET + om.siguiente });
+          return json({ siguiente: sg.siguiente, numeroInterno: serieQ.offset + sg.siguiente });
         }
         const rows = await sql`
           SELECT COALESCE(
@@ -212,7 +219,7 @@ export default {
             ), 921
           ) + 1 AS siguiente
           FROM nc
-          WHERE tipo <> ${TIPO_OM}
+          WHERE numero < ${NC_MAX_INTERNO}
         `;
         return json({ siguiente: rows[0].siguiente });
       }
@@ -242,19 +249,27 @@ export default {
       if (request.method === "POST" && parts[1] === "nc" && !parts[2]) {
         const b = await request.json();
         // Clasificación (solo NC/hallazgos; las OM no se clasifican) y devolución efectiva (solo reclamos)
+        const serie = serieDeTipo(b.tipo);
         const esOM = b.tipo === TIPO_OM;
-        const clase = esOM ? null : b.clasificacion || null;
+        const clase = esOM ? null : b.clasificacion || (b.tipo === TIPO_HA ? "Hallazgos de Auditoría" : null);
         if (clase && !CLASES_NC.includes(clase)) return json({ error: "Clasificación inválida" }, 400);
         const conDev = clase === "Reclamos de Clientes" && typeof b.conDevolucion === "boolean" ? b.conDevolucion : null;
         let numero = b.numero;
         let numeroOriginal = null;
-        if (esOM) {
-          // La OM toma siempre el próximo correlativo propio, sin confiar en el número que manda el cliente
-          const [om] = await sql`
-            SELECT COALESCE(MAX(numero_original), ${OM_ULTIMA_HISTORICA}) + 1 AS siguiente FROM nc WHERE tipo = ${TIPO_OM}
-          `;
-          numeroOriginal = om.siguiente;
-          numero = OM_OFFSET + om.siguiente;
+        if (serie) {
+          // Serie propia: el cliente puede indicar el número (carga manual de OM históricas); si no, el próximo.
+          let n = Number.isInteger(b.numeroSerie) && b.numeroSerie > 0 && b.numeroSerie < 100000 ? b.numeroSerie : null;
+          if (n === null) {
+            const [sg] = await sql`
+              SELECT GREATEST(COALESCE(MAX(numero_original), 0), ${serie.base}) + 1 AS siguiente
+              FROM nc WHERE numero >= ${serie.offset} AND numero < ${serie.offset + 100000}
+            `;
+            n = sg.siguiente;
+          }
+          const [dup] = await sql`SELECT numero FROM nc WHERE numero = ${serie.offset + n}`;
+          if (dup) return json({ error: `Ya existe el ${esOM ? "OM" : "hallazgo"} Nº ${n}` }, 409);
+          numeroOriginal = n;
+          numero = serie.offset + n;
         }
         const [row] = await sql`
           INSERT INTO nc (
@@ -276,7 +291,7 @@ export default {
         `;
         await sql`
           INSERT INTO nc_historial (nc_numero, campo, valor_anterior, valor_nuevo, usuario)
-          VALUES (${numero}, 'creación', NULL, ${esOM ? "OM creada" : "NC creada"}, ${b.usuario || usuarioToken})
+          VALUES (${numero}, 'creación', NULL, ${esOM ? "OM creada" : b.tipo === TIPO_HA ? "Hallazgo creado" : "NC creada"}, ${b.usuario || usuarioToken})
         `;
         return json(row, 201);
       }
