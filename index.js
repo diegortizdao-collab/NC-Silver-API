@@ -132,8 +132,9 @@ export default {
     let rrhhBody = null;
     if (MAILS_RRHH.has(usuarioToken)) {
       const enValores = parts[0] === "api" && parts[1] === "apc" && parts[2] === "valores";
-      if (!(enValores && (request.method === "PUT" || request.method === "GET"))) return json({ error: "Acceso restringido: esta cuenta solo carga el ausentismo" }, 403);
-      if (request.method === "PUT") {
+      const enRRHH = parts[0] === "api" && parts[1] === "rrhh";
+      if (!enRRHH && !(enValores && (request.method === "PUT" || request.method === "GET"))) return json({ error: "Acceso restringido: esta cuenta solo accede a RRHH" }, 403);
+      if (!enRRHH && request.method === "PUT") {
         rrhhBody = await request.clone().json().catch(() => ({}));
         const vals = Array.isArray(rrhhBody.valores) ? rrhhBody.valores : [];
         if (!vals.length || vals.some((v) => v.indicador !== "ausentismo")) return json({ error: "Esta cuenta solo puede cargar el indicador ausentismo" }, 403);
@@ -481,6 +482,124 @@ export default {
           else await sql`INSERT INTO apc_cierres (periodo, cerrado_por) VALUES (${b.periodo}, ${usuarioToken}) ON CONFLICT (periodo) DO NOTHING`;
           return json({ ok: true, periodo: b.periodo, cerrado: b.cerrar !== false });
         }
+      }
+
+      // ---------------------------------------------------------------------------
+      // RRHH: personal, programa de capacitación (A.18) y registro de asistencia (A.14 / A.26)
+      // Datos personales: solo cuentas de RRHH y generales. Ver db/003_rrhh_capacitacion.sql
+      // ---------------------------------------------------------------------------
+      const anioCerrado = async (anio) => {
+        const [r] = await sql`SELECT 1 FROM apc_cierres WHERE periodo = ${String(anio)}`;
+        return !!r;
+      };
+      const ESTADOS = ["Agendada", "Cumplida", "Reprogramada", "Cancelada"];
+      const aFecha = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(v || "") ? v : null);
+
+      // GET /api/rrhh/personal ; PUT /api/rrhh/personal {personal:[{legajo,nombre,activo}]}
+      if (parts[1] === "rrhh" && parts[2] === "personal") {
+        if (request.method === "GET") return json(await sql`SELECT legajo, nombre, activo FROM rrhh_personal ORDER BY legajo`);
+        if (request.method === "PUT") {
+          const b = await request.json();
+          const lista = Array.isArray(b.personal) ? b.personal : [];
+          let n = 0;
+          for (const p of lista) {
+            const legajo = Number(p.legajo);
+            if (!Number.isInteger(legajo) || !String(p.nombre || "").trim()) continue;
+            await sql`
+              INSERT INTO rrhh_personal (legajo, nombre, activo, actualizado_por, actualizado_en)
+              VALUES (${legajo}, ${String(p.nombre).trim()}, ${p.activo !== false}, ${usuarioToken}, now())
+              ON CONFLICT (legajo) DO UPDATE SET nombre = EXCLUDED.nombre, activo = EXCLUDED.activo,
+                actualizado_por = EXCLUDED.actualizado_por, actualizado_en = now()`;
+            n++;
+          }
+          return json({ ok: true, guardados: n });
+        }
+      }
+
+      // GET /api/rrhh/capacitaciones?anio=2026 ; PUT /api/rrhh/capacitaciones {id?, anio, tema, ...}
+      if (parts[1] === "rrhh" && parts[2] === "capacitaciones" && !parts[3]) {
+        if (request.method === "GET") {
+          const anio = url.searchParams.get("anio") ? Number(url.searchParams.get("anio")) : null;
+          const rows = await sql`
+            SELECT c.*, (SELECT count(*)::int FROM rrhh_asistencia a WHERE a.cap_id = c.id) AS asistentes
+            FROM rrhh_capacitaciones c
+            WHERE (${anio}::int IS NULL OR c.anio = ${anio}::int)
+            ORDER BY c.anio DESC, c.fecha_real NULLS LAST, c.fecha_plan NULLS LAST, c.id`;
+          return json(rows);
+        }
+        if (request.method === "PUT") {
+          const b = await request.json();
+          const anio = Number(b.anio);
+          if (!Number.isInteger(anio) || anio < 2000 || !String(b.tema || "").trim()) return json({ error: "Faltan año o tema" }, 400);
+          if (!ESTADOS.includes(b.estado || "Agendada")) return json({ error: "Estado inválido" }, 400);
+          if (await anioCerrado(anio)) return json({ error: "El año " + anio + " está cerrado" }, 409);
+          const tipo = b.tipo === "Interno" || b.tipo === "Externo" ? b.tipo : null;
+          const efectiva = typeof b.efect_efectiva === "boolean" ? b.efect_efectiva : null;
+          if (b.id) {
+            const [row] = await sql`
+              UPDATE rrhh_capacitaciones SET anio = ${anio}, tema = ${b.tema.trim()}, instructor = ${b.instructor || null}, tipo = ${tipo},
+                periodo_plan = ${b.periodo_plan || null}, fecha_plan = ${aFecha(b.fecha_plan)}, destinatarios = ${b.destinatarios || null},
+                lugar = ${b.lugar || null}, programada = ${b.programada !== false}, estado = ${b.estado || "Agendada"},
+                fecha_real = ${aFecha(b.fecha_real)}, duracion = ${b.duracion || null}, temas = ${b.temas || null}, observaciones = ${b.observaciones || null},
+                efect_fecha_programada = ${aFecha(b.efect_fecha_programada)}, efect_efectiva = ${efectiva}, efect_fecha_real = ${aFecha(b.efect_fecha_real)},
+                efect_evaluador = ${b.efect_evaluador || null}, efect_acciones = ${b.efect_acciones || null},
+                actualizado_por = ${usuarioToken}, actualizado_en = now()
+              WHERE id = ${Number(b.id)} RETURNING *`;
+            if (!row) return json({ error: "No existe la capacitación" }, 404);
+            return json(row);
+          }
+          const [row] = await sql`
+            INSERT INTO rrhh_capacitaciones (anio, tema, instructor, tipo, periodo_plan, fecha_plan, destinatarios, lugar, programada, estado,
+              fecha_real, duracion, temas, observaciones, efect_fecha_programada, efect_efectiva, efect_fecha_real, efect_evaluador, efect_acciones, actualizado_por)
+            VALUES (${anio}, ${b.tema.trim()}, ${b.instructor || null}, ${tipo}, ${b.periodo_plan || null}, ${aFecha(b.fecha_plan)}, ${b.destinatarios || null},
+              ${b.lugar || null}, ${b.programada !== false}, ${b.estado || "Agendada"}, ${aFecha(b.fecha_real)}, ${b.duracion || null}, ${b.temas || null},
+              ${b.observaciones || null}, ${aFecha(b.efect_fecha_programada)}, ${efectiva}, ${aFecha(b.efect_fecha_real)}, ${b.efect_evaluador || null},
+              ${b.efect_acciones || null}, ${usuarioToken})
+            RETURNING *`;
+          return json(row, 201);
+        }
+      }
+
+      // GET /api/rrhh/capacitaciones/:id -> capacitación + asistentes ; PUT /api/rrhh/capacitaciones/:id/asistencia {asistentes:[{legajo,calificacion,observaciones}]}
+      if (parts[1] === "rrhh" && parts[2] === "capacitaciones" && parts[3]) {
+        const id = Number(parts[3]);
+        if (!Number.isInteger(id)) return json({ error: "Id inválido" }, 400);
+        if (request.method === "GET" && !parts[4]) {
+          const [cap] = await sql`SELECT * FROM rrhh_capacitaciones WHERE id = ${id}`;
+          if (!cap) return json({ error: "No existe la capacitación" }, 404);
+          const asistentes = await sql`
+            SELECT a.legajo, p.nombre, a.calificacion, a.observaciones
+            FROM rrhh_asistencia a JOIN rrhh_personal p ON p.legajo = a.legajo WHERE a.cap_id = ${id} ORDER BY p.nombre`;
+          return json({ ...cap, asistentes });
+        }
+        if (request.method === "PUT" && parts[4] === "asistencia") {
+          const [cap] = await sql`SELECT anio FROM rrhh_capacitaciones WHERE id = ${id}`;
+          if (!cap) return json({ error: "No existe la capacitación" }, 404);
+          if (await anioCerrado(cap.anio)) return json({ error: "El año " + cap.anio + " está cerrado" }, 409);
+          const b = await request.json();
+          const lista = Array.isArray(b.asistentes) ? b.asistentes : [];
+          await sql`DELETE FROM rrhh_asistencia WHERE cap_id = ${id}`;
+          let n = 0;
+          for (const a of lista) {
+            const legajo = Number(a.legajo);
+            if (!Number.isInteger(legajo)) continue;
+            const cal = ["S", "PS", "NS"].includes(a.calificacion) ? a.calificacion : null;
+            await sql`INSERT INTO rrhh_asistencia (cap_id, legajo, calificacion, observaciones) VALUES (${id}, ${legajo}, ${cal}, ${a.observaciones || null}) ON CONFLICT DO NOTHING`;
+            n++;
+          }
+          await sql`UPDATE rrhh_capacitaciones SET actualizado_por = ${usuarioToken}, actualizado_en = now() WHERE id = ${id}`;
+          return json({ ok: true, asistentes: n });
+        }
+      }
+
+      // GET /api/apc/capacitacion-resumen?anio=2026 -> {programadas, cumplidas, valor} para el Apéndice C (sin nombres)
+      if (request.method === "GET" && parts[1] === "apc" && parts[2] === "capacitacion-resumen") {
+        const anio = Number(url.searchParams.get("anio")) || new Date().getUTCFullYear();
+        const [r] = await sql`
+          SELECT count(*) FILTER (WHERE programada AND estado <> 'Cancelada')::int AS programadas,
+                 count(*) FILTER (WHERE programada AND estado = 'Cumplida')::int AS cumplidas
+          FROM rrhh_capacitaciones WHERE anio = ${anio}`;
+        return json({ anio, programadas: r.programadas, cumplidas: r.cumplidas, valor: r.programadas ? r.cumplidas / r.programadas : null, cerrado: await anioCerrado(anio) });
       }
 
       return json({ error: "Ruta no encontrada" }, 404);
