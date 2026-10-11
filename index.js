@@ -29,6 +29,14 @@ const MAILS_AUTORIZADOS = new Set([
 const MAILS_RRHH = new Set([
   "rrhh@silverindustrial.com.ar", // Ignacio (RRHH)
 ]);
+// Ausentismo por persona (datos personales): solo RRHH, Gestión de calidad y dueños. Las demás cuentas generales NO acceden.
+const MAILS_PERSONAS = new Set([
+  "rrhh@silverindustrial.com.ar",
+  "diegortizdao@gmail.com",
+  "gestioncalidad@silverindustrial.com.ar",
+  "fernando@silverindustrial.com.ar",
+  "hernan@silverindustrial.com.ar",
+]);
 const TOKEN_HORAS = 12;
 
 // Tipos de informe con numeración propia (PR.05 Rev. 6). El número interno es offset+n para no chocar
@@ -589,6 +597,40 @@ export default {
           }
           await sql`UPDATE rrhh_capacitaciones SET actualizado_por = ${usuarioToken}, actualizado_en = now() WHERE id = ${id}`;
           return json({ ok: true, asistentes: n });
+        }
+      }
+
+      // ---- Ausentismo por persona y por mes (datos personales: ver MAILS_PERSONAS) ----
+      // GET /api/rrhh/aus-personas?desde=YYYY-MM&hasta=YYYY-MM -> [{periodo,legajo,codigos:[...],laborables}]
+      // PUT /api/rrhh/aus-personas {periodo, filas:[{legajo,codigos:[...],laborables}]}
+      if (parts[1] === "rrhh" && parts[2] === "aus-personas") {
+        if (!MAILS_PERSONAS.has(usuarioToken)) return json({ error: "Sin permiso para ver o cargar el ausentismo por persona" }, 403);
+        const reMes = /^\d{4}-(0[1-9]|1[0-2])$/;
+        if (request.method === "GET") {
+          const desde = reMes.test(url.searchParams.get("desde") || "") ? url.searchParams.get("desde") : "0000-01";
+          const hasta = reMes.test(url.searchParams.get("hasta") || "") ? url.searchParams.get("hasta") : "9999-12";
+          const rows = await sql`SELECT periodo, legajo, codigos, laborables FROM rrhh_aus_mes WHERE periodo >= ${desde} AND periodo <= ${hasta} ORDER BY periodo, legajo`;
+          return json(rows.map((r) => ({ ...r, codigos: String(r.codigos).split("|") })));
+        }
+        if (request.method === "PUT") {
+          const b = await request.json();
+          if (!reMes.test(b.periodo || "")) return json({ error: "Período inválido" }, 400);
+          if (await periodoCerrado(b.periodo)) return json({ error: "El período " + b.periodo + " está cerrado" }, 409);
+          const filas = Array.isArray(b.filas) ? b.filas : [];
+          let n = 0;
+          for (const f of filas) {
+            const legajo = Number(f.legajo);
+            if (!Number.isInteger(legajo) || !Array.isArray(f.codigos) || f.codigos.length < 28 || f.codigos.length > 31) continue;
+            const codigos = f.codigos.map((c) => String(c || "").toUpperCase().replace(/[|\n]/g, "").slice(0, 12)).join("|");
+            const lab = Number.isFinite(Number(f.laborables)) ? Math.round(Number(f.laborables)) : null;
+            await sql`
+              INSERT INTO rrhh_aus_mes (periodo, legajo, codigos, laborables, fuente, actualizado_por, actualizado_en)
+              VALUES (${b.periodo}, ${legajo}, ${codigos}, ${lab}, ${String(b.fuente || "").slice(0, 120) || null}, ${usuarioToken}, now())
+              ON CONFLICT (periodo, legajo) DO UPDATE SET codigos = EXCLUDED.codigos, laborables = EXCLUDED.laborables,
+                fuente = EXCLUDED.fuente, actualizado_por = EXCLUDED.actualizado_por, actualizado_en = now()`;
+            n++;
+          }
+          return json({ ok: true, guardados: n });
         }
       }
 
