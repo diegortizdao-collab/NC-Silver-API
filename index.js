@@ -21,6 +21,12 @@ const MAILS_AUTORIZADOS = new Set([
   "controlcalidad@silverindustrial.com.ar",
   "controldeproducion@silverindustrial.com.ar", // sic: así lo informó el usuario; confirmar ortografía
 ]);
+// Cuentas de RRHH: solo pueden cargar el ausentismo (PUT /api/apc/valores con indicador "ausentismo").
+// Usan su propia contraseña (secreto RRHH_PASSWORD), distinta de la contraseña general.
+// Agregar acá el mail de Ignacio (RRHH) y crear el secreto RRHH_PASSWORD en Cloudflare.
+const MAILS_RRHH = new Set([
+  // "ignacio@empresa.com.ar",
+]);
 const TOKEN_HORAS = 12;
 
 // Tipos de informe con numeración propia (PR.05 Rev. 6). El número interno es offset+n para no chocar
@@ -73,7 +79,7 @@ async function verificarToken(token, authSecret) {
   if (!(await iguales(firma, await hmac(authSecret, payload)))) return null;
   try {
     const d = JSON.parse(unb64uStr(payload));
-    if (!d.exp || d.exp < Date.now() || !MAILS_AUTORIZADOS.has(d.email)) return null;
+    if (!d.exp || d.exp < Date.now() || !(MAILS_AUTORIZADOS.has(d.email) || MAILS_RRHH.has(d.email))) return null;
     return d.email;
   } catch {
     return null;
@@ -104,19 +110,31 @@ export default {
       let b = {};
       try { b = await request.json(); } catch {}
       const email = String(b.email || "").trim().toLowerCase();
-      const okMail = MAILS_AUTORIZADOS.has(email);
-      const okPass = await iguales(String(b.password || ""), appPassword);
+      const esRRHH = MAILS_RRHH.has(email);
+      const okMail = MAILS_AUTORIZADOS.has(email) || esRRHH;
+      const passEsperada = esRRHH ? await secreto(env.RRHH_PASSWORD) : appPassword;
+      const okPass = !!passEsperada && (await iguales(String(b.password || ""), passEsperada));
       if (!okMail || !okPass) {
         await new Promise((r) => setTimeout(r, 600)); // frena la fuerza bruta
         return json({ error: "Mail o contraseña incorrectos" }, 401);
       }
-      return json({ token: await emitirToken(email, authSecret), email, expira: Date.now() + TOKEN_HORAS * 3600 * 1000 });
+      return json({ token: await emitirToken(email, authSecret), email, rol: esRRHH ? "rrhh" : "general", expira: Date.now() + TOKEN_HORAS * 3600 * 1000 });
     }
 
     // Todo lo demás exige un token válido
     const authSecret = await secreto(env.AUTH_SECRET);
     const usuarioToken = await verificarToken((request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, ""), authSecret);
     if (!usuarioToken) return json({ error: "No autorizado" }, 401);
+
+    // Cuentas de RRHH: solo pueden guardar ausentismo (y nada más).
+    let rrhhBody = null;
+    if (MAILS_RRHH.has(usuarioToken)) {
+      const soloAusentismo = request.method === "PUT" && parts[0] === "api" && parts[1] === "apc" && parts[2] === "valores";
+      if (!soloAusentismo) return json({ error: "Acceso restringido: esta cuenta solo carga el ausentismo" }, 403);
+      rrhhBody = await request.clone().json().catch(() => ({}));
+      const vals = Array.isArray(rrhhBody.valores) ? rrhhBody.valores : [];
+      if (!vals.length || vals.some((v) => v.indicador !== "ausentismo")) return json({ error: "Esta cuenta solo puede cargar el indicador ausentismo" }, 403);
+    }
 
     try {
       if (!env.DATABASE_URL) {
