@@ -20,12 +20,14 @@ const MAILS_AUTORIZADOS = new Set([
   "dortiz@escorial.com.ar",
   "controlcalidad@silverindustrial.com.ar",
   "controldeproducion@silverindustrial.com.ar", // sic: así lo informó el usuario; confirmar ortografía
+  "fernando@silverindustrial.com.ar", // dueño
+  "hernan@silverindustrial.com.ar", // dueño
 ]);
 // Cuentas de RRHH: solo pueden cargar el ausentismo (PUT /api/apc/valores con indicador "ausentismo").
 // Usan su propia contraseña (secreto RRHH_PASSWORD), distinta de la contraseña general.
 // Agregar acá el mail de Ignacio (RRHH) y crear el secreto RRHH_PASSWORD en Cloudflare.
 const MAILS_RRHH = new Set([
-  // "ignacio@empresa.com.ar",
+  "rrhh@silverindustrial.com.ar", // Ignacio (RRHH)
 ]);
 const TOKEN_HORAS = 12;
 
@@ -129,11 +131,13 @@ export default {
     // Cuentas de RRHH: solo pueden guardar ausentismo (y nada más).
     let rrhhBody = null;
     if (MAILS_RRHH.has(usuarioToken)) {
-      const soloAusentismo = request.method === "PUT" && parts[0] === "api" && parts[1] === "apc" && parts[2] === "valores";
-      if (!soloAusentismo) return json({ error: "Acceso restringido: esta cuenta solo carga el ausentismo" }, 403);
-      rrhhBody = await request.clone().json().catch(() => ({}));
-      const vals = Array.isArray(rrhhBody.valores) ? rrhhBody.valores : [];
-      if (!vals.length || vals.some((v) => v.indicador !== "ausentismo")) return json({ error: "Esta cuenta solo puede cargar el indicador ausentismo" }, 403);
+      const enValores = parts[0] === "api" && parts[1] === "apc" && parts[2] === "valores";
+      if (!(enValores && (request.method === "PUT" || request.method === "GET"))) return json({ error: "Acceso restringido: esta cuenta solo carga el ausentismo" }, 403);
+      if (request.method === "PUT") {
+        rrhhBody = await request.clone().json().catch(() => ({}));
+        const vals = Array.isArray(rrhhBody.valores) ? rrhhBody.valores : [];
+        if (!vals.length || vals.some((v) => v.indicador !== "ausentismo")) return json({ error: "Esta cuenta solo puede cargar el indicador ausentismo" }, 403);
+      }
     }
 
     try {
@@ -445,7 +449,10 @@ export default {
 
       // GET /api/apc/valores ; PUT /api/apc/valores {valores:[{indicador,periodo,valor,num,den,fuente}]}
       if (parts[1] === "apc" && parts[2] === "valores") {
-        if (request.method === "GET") return json(await sql`SELECT * FROM apc_valores ORDER BY indicador, periodo`);
+        if (request.method === "GET") {
+          if (MAILS_RRHH.has(usuarioToken)) return json(await sql`SELECT * FROM apc_valores WHERE indicador = 'ausentismo' ORDER BY periodo`);
+          return json(await sql`SELECT * FROM apc_valores ORDER BY indicador, periodo`);
+        }
         if (request.method === "PUT") {
           const b = await request.json();
           const vals = Array.isArray(b.valores) ? b.valores : [];
