@@ -2,22 +2,10 @@ name = "nc-silver-api"
 main = "index.js"
 compatibility_date = "2024-09-23"
 
-[[secrets_store_secrets]]
-binding = "DATABASE_URL"
-store_id = "016a0d22aadd49bfab8f219be3c83f25"
-secret_name = "DATABASE_URL"
-
-# Declarados acá para que cada deploy los conserve (si no figuran en este archivo, wrangler los borra).
-# Crear una sola vez en Cloudflare > Secrets Store, con estos nombres exactos.
-[[secrets_store_secrets]]
-binding = "AUTH_SECRET"
-store_id = "016a0d22aadd49bfab8f219be3c83f25"
-secret_name = "AUTH_SECRET"
-
-[[secrets_store_secrets]]
-binding = "APP_PASSWORD"
-store_id = "016a0d22aadd49bfab8f219be3c83f25"
-secret_name = "APP_PASSWORD"
+# DATABASE_URL, AUTH_SECRET y APP_PASSWORD son Secrets comunes del Worker
+# (Cloudflare > Workers > nc-silver-api > Settings > Variables and Secrets > tipo "Secret").
+# Los secrets comunes NO se borran con los deploys; los bindings de Secrets Store que no figuren
+# en este archivo sí. El código acepta ambos tipos (ver secreto() en index.js).
 
 [[r2_buckets]]
 binding = "NC_DOCS"
