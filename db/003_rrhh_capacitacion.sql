@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS rrhh_capacitaciones (
   observaciones text,
   -- Evaluación de la efectividad (A.14)
   efect_fecha_programada date,
+  efect_evaluacion text,                               -- A.14 "Evaluación:" (texto libre)
   efect_efectiva   boolean,
   efect_fecha_real date,
   efect_evaluador  text,
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS rrhh_capacitaciones (
   actualizado_por text,
   actualizado_en  timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE rrhh_capacitaciones ADD COLUMN IF NOT EXISTS efect_evaluacion text;
 CREATE INDEX IF NOT EXISTS rrhh_cap_anio_idx ON rrhh_capacitaciones (anio);
 
 CREATE TABLE IF NOT EXISTS rrhh_asistencia (

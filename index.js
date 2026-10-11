@@ -541,7 +541,7 @@ export default {
                 periodo_plan = ${b.periodo_plan || null}, fecha_plan = ${aFecha(b.fecha_plan)}, destinatarios = ${b.destinatarios || null},
                 lugar = ${b.lugar || null}, programada = ${b.programada !== false}, estado = ${b.estado || "Agendada"},
                 fecha_real = ${aFecha(b.fecha_real)}, duracion = ${b.duracion || null}, temas = ${b.temas || null}, observaciones = ${b.observaciones || null},
-                efect_fecha_programada = ${aFecha(b.efect_fecha_programada)}, efect_efectiva = ${efectiva}, efect_fecha_real = ${aFecha(b.efect_fecha_real)},
+                efect_fecha_programada = ${aFecha(b.efect_fecha_programada)}, efect_evaluacion = ${b.efect_evaluacion || null}, efect_efectiva = ${efectiva}, efect_fecha_real = ${aFecha(b.efect_fecha_real)},
                 efect_evaluador = ${b.efect_evaluador || null}, efect_acciones = ${b.efect_acciones || null},
                 actualizado_por = ${usuarioToken}, actualizado_en = now()
               WHERE id = ${Number(b.id)} RETURNING *`;
@@ -550,10 +550,10 @@ export default {
           }
           const [row] = await sql`
             INSERT INTO rrhh_capacitaciones (anio, tema, instructor, tipo, periodo_plan, fecha_plan, destinatarios, lugar, programada, estado,
-              fecha_real, duracion, temas, observaciones, efect_fecha_programada, efect_efectiva, efect_fecha_real, efect_evaluador, efect_acciones, actualizado_por)
+              fecha_real, duracion, temas, observaciones, efect_fecha_programada, efect_evaluacion, efect_efectiva, efect_fecha_real, efect_evaluador, efect_acciones, actualizado_por)
             VALUES (${anio}, ${b.tema.trim()}, ${b.instructor || null}, ${tipo}, ${b.periodo_plan || null}, ${aFecha(b.fecha_plan)}, ${b.destinatarios || null},
               ${b.lugar || null}, ${b.programada !== false}, ${b.estado || "Agendada"}, ${aFecha(b.fecha_real)}, ${b.duracion || null}, ${b.temas || null},
-              ${b.observaciones || null}, ${aFecha(b.efect_fecha_programada)}, ${efectiva}, ${aFecha(b.efect_fecha_real)}, ${b.efect_evaluador || null},
+              ${b.observaciones || null}, ${aFecha(b.efect_fecha_programada)}, ${b.efect_evaluacion || null}, ${efectiva}, ${aFecha(b.efect_fecha_real)}, ${b.efect_evaluador || null},
               ${b.efect_acciones || null}, ${usuarioToken})
             RETURNING *`;
           return json(row, 201);
