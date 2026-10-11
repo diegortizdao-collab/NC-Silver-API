@@ -441,12 +441,18 @@ export default {
           const b = await request.json();
           const meses = Array.isArray(b.meses) ? b.meses : [];
           const rechazados = [];
+          const cerrados = new Set((await sql`SELECT periodo FROM apc_cierres`).map((r) => r.periodo));
+          const ok = [];
           for (const m of meses) {
             if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(m.mes || "")) { rechazados.push({ mes: m.mes, motivo: "mes inválido" }); continue; }
-            if (await periodoCerrado(m.mes)) { rechazados.push({ mes: m.mes, motivo: "período cerrado" }); continue; }
+            if (cerrados.has(m.mes) || cerrados.has(m.mes.slice(0, 4))) { rechazados.push({ mes: m.mes, motivo: "período cerrado" }); continue; }
+            ok.push(m);
+          }
+          if (ok.length) {
             await sql`
               INSERT INTO apc_oti_mensual (mes, oti_total, oti_ent, atrasos, fuente, actualizado_por, actualizado_en)
-              VALUES (${m.mes}, ${m.oti_total | 0}, ${m.oti_ent | 0}, ${m.atrasos | 0}, ${m.fuente || null}, ${usuarioToken}, now())
+              SELECT t.mes, t.ot, t.oe, t.at, t.fu, ${usuarioToken}, now()
+              FROM unnest(${ok.map((m) => m.mes)}::text[], ${ok.map((m) => m.oti_total | 0)}::int[], ${ok.map((m) => m.oti_ent | 0)}::int[], ${ok.map((m) => m.atrasos | 0)}::int[], ${ok.map((m) => m.fuente || null)}::text[]) AS t(mes, ot, oe, at, fu)
               ON CONFLICT (mes) DO UPDATE SET oti_total = EXCLUDED.oti_total, oti_ent = EXCLUDED.oti_ent,
                 atrasos = EXCLUDED.atrasos, fuente = EXCLUDED.fuente,
                 actualizado_por = EXCLUDED.actualizado_por, actualizado_en = now()
@@ -466,15 +472,20 @@ export default {
           const b = await request.json();
           const vals = Array.isArray(b.valores) ? b.valores : [];
           const rechazados = [];
-          if (vals.length > 25) return json({ error: "Demasiados valores en un pedido (máximo 25); enviá la carga en tandas" }, 400);
+          if (vals.length > 500) return json({ error: "Demasiados valores en un pedido (máximo 500)" }, 400);
           // Una sola consulta para los períodos cerrados (Cloudflare limita las consultas por pedido).
           const cerrados = new Set((await sql`SELECT periodo FROM apc_cierres`).map((r) => r.periodo));
+          const ok = [];
           for (const v of vals) {
             if (!v.indicador || !/^\d{4}(-(0[1-9]|1[0-2]))?$/.test(v.periodo || "")) { rechazados.push({ indicador: v.indicador, periodo: v.periodo, motivo: "datos inválidos" }); continue; }
             if (cerrados.has(v.periodo) || cerrados.has(v.periodo.slice(0, 4))) { rechazados.push({ indicador: v.indicador, periodo: v.periodo, motivo: "período cerrado" }); continue; }
+            ok.push(v);
+          }
+          if (ok.length) {
             await sql`
               INSERT INTO apc_valores (indicador, periodo, valor, num, den, fuente, actualizado_por, actualizado_en)
-              VALUES (${v.indicador}, ${v.periodo}, ${v.valor ?? null}, ${v.num ?? null}, ${v.den ?? null}, ${v.fuente || null}, ${usuarioToken}, now())
+              SELECT t.i, t.p, t.v, t.n, t.d, t.f, ${usuarioToken}, now()
+              FROM unnest(${ok.map((v) => v.indicador)}::text[], ${ok.map((v) => v.periodo)}::text[], ${ok.map((v) => v.valor ?? null)}::float8[], ${ok.map((v) => v.num ?? null)}::float8[], ${ok.map((v) => v.den ?? null)}::float8[], ${ok.map((v) => v.fuente || null)}::text[]) AS t(i, p, v, n, d, f)
               ON CONFLICT (indicador, periodo) DO UPDATE SET valor = EXCLUDED.valor, num = EXCLUDED.num, den = EXCLUDED.den,
                 fuente = EXCLUDED.fuente, actualizado_por = EXCLUDED.actualizado_por, actualizado_en = now()
             `;
