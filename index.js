@@ -466,9 +466,12 @@ export default {
           const b = await request.json();
           const vals = Array.isArray(b.valores) ? b.valores : [];
           const rechazados = [];
+          if (vals.length > 25) return json({ error: "Demasiados valores en un pedido (máximo 25); enviá la carga en tandas" }, 400);
+          // Una sola consulta para los períodos cerrados (Cloudflare limita las consultas por pedido).
+          const cerrados = new Set((await sql`SELECT periodo FROM apc_cierres`).map((r) => r.periodo));
           for (const v of vals) {
             if (!v.indicador || !/^\d{4}(-(0[1-9]|1[0-2]))?$/.test(v.periodo || "")) { rechazados.push({ indicador: v.indicador, periodo: v.periodo, motivo: "datos inválidos" }); continue; }
-            if (await periodoCerrado(v.periodo)) { rechazados.push({ indicador: v.indicador, periodo: v.periodo, motivo: "período cerrado" }); continue; }
+            if (cerrados.has(v.periodo) || cerrados.has(v.periodo.slice(0, 4))) { rechazados.push({ indicador: v.indicador, periodo: v.periodo, motivo: "período cerrado" }); continue; }
             await sql`
               INSERT INTO apc_valores (indicador, periodo, valor, num, den, fuente, actualizado_por, actualizado_en)
               VALUES (${v.indicador}, ${v.periodo}, ${v.valor ?? null}, ${v.num ?? null}, ${v.den ?? null}, ${v.fuente || null}, ${usuarioToken}, now())
