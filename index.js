@@ -380,6 +380,84 @@ export default {
         return json(row, 201);
       }
 
+      // ---------------------------------------------------------------------------
+      // Apéndice C (indicadores) — ver db/002_apendice_c.sql e Instructivo I.09 Rev. 012
+      // ---------------------------------------------------------------------------
+      const periodoCerrado = async (periodo) => {
+        const anio = periodo.slice(0, 4);
+        const [r] = await sql`SELECT 1 FROM apc_cierres WHERE periodo = ${periodo} OR periodo = ${anio}`;
+        return !!r;
+      };
+
+      // GET /api/apc/nc-mensual -> quejas, devoluciones y fallas por mes (desde las NC de Q.21)
+      if (request.method === "GET" && parts[1] === "apc" && parts[2] === "nc-mensual") {
+        const rows = await sql`
+          SELECT to_char(fecha_produccion, 'YYYY-MM') AS mes,
+                 count(*) FILTER (WHERE clasificacion = 'Reclamos de Clientes')::int AS quejas,
+                 count(*) FILTER (WHERE clasificacion = 'Reclamos de Clientes' AND con_devolucion IS TRUE)::int AS devol,
+                 count(*) FILTER (WHERE clasificacion = 'Defectos x Control de Calidad')::int AS fallas
+          FROM nc
+          WHERE tipo <> ${TIPO_OM} AND fecha_produccion IS NOT NULL
+          GROUP BY 1 ORDER BY 1
+        `;
+        return json(rows);
+      }
+
+      // GET /api/apc/oti -> OTI por mes ; PUT /api/apc/oti {meses:[{mes,oti_total,oti_ent,atrasos}]}
+      if (parts[1] === "apc" && parts[2] === "oti") {
+        if (request.method === "GET") return json(await sql`SELECT * FROM apc_oti_mensual ORDER BY mes`);
+        if (request.method === "PUT") {
+          const b = await request.json();
+          const meses = Array.isArray(b.meses) ? b.meses : [];
+          const rechazados = [];
+          for (const m of meses) {
+            if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(m.mes || "")) { rechazados.push({ mes: m.mes, motivo: "mes inválido" }); continue; }
+            if (await periodoCerrado(m.mes)) { rechazados.push({ mes: m.mes, motivo: "período cerrado" }); continue; }
+            await sql`
+              INSERT INTO apc_oti_mensual (mes, oti_total, oti_ent, atrasos, fuente, actualizado_por, actualizado_en)
+              VALUES (${m.mes}, ${m.oti_total | 0}, ${m.oti_ent | 0}, ${m.atrasos | 0}, ${m.fuente || null}, ${usuarioToken}, now())
+              ON CONFLICT (mes) DO UPDATE SET oti_total = EXCLUDED.oti_total, oti_ent = EXCLUDED.oti_ent,
+                atrasos = EXCLUDED.atrasos, fuente = EXCLUDED.fuente,
+                actualizado_por = EXCLUDED.actualizado_por, actualizado_en = now()
+            `;
+          }
+          return json({ ok: true, guardados: meses.length - rechazados.length, rechazados });
+        }
+      }
+
+      // GET /api/apc/valores ; PUT /api/apc/valores {valores:[{indicador,periodo,valor,num,den,fuente}]}
+      if (parts[1] === "apc" && parts[2] === "valores") {
+        if (request.method === "GET") return json(await sql`SELECT * FROM apc_valores ORDER BY indicador, periodo`);
+        if (request.method === "PUT") {
+          const b = await request.json();
+          const vals = Array.isArray(b.valores) ? b.valores : [];
+          const rechazados = [];
+          for (const v of vals) {
+            if (!v.indicador || !/^\d{4}(-(0[1-9]|1[0-2]))?$/.test(v.periodo || "")) { rechazados.push({ indicador: v.indicador, periodo: v.periodo, motivo: "datos inválidos" }); continue; }
+            if (await periodoCerrado(v.periodo)) { rechazados.push({ indicador: v.indicador, periodo: v.periodo, motivo: "período cerrado" }); continue; }
+            await sql`
+              INSERT INTO apc_valores (indicador, periodo, valor, num, den, fuente, actualizado_por, actualizado_en)
+              VALUES (${v.indicador}, ${v.periodo}, ${v.valor ?? null}, ${v.num ?? null}, ${v.den ?? null}, ${v.fuente || null}, ${usuarioToken}, now())
+              ON CONFLICT (indicador, periodo) DO UPDATE SET valor = EXCLUDED.valor, num = EXCLUDED.num, den = EXCLUDED.den,
+                fuente = EXCLUDED.fuente, actualizado_por = EXCLUDED.actualizado_por, actualizado_en = now()
+            `;
+          }
+          return json({ ok: true, guardados: vals.length - rechazados.length, rechazados });
+        }
+      }
+
+      // GET /api/apc/cierres ; POST /api/apc/cierres {periodo, cerrar: true|false}
+      if (parts[1] === "apc" && parts[2] === "cierres") {
+        if (request.method === "GET") return json(await sql`SELECT * FROM apc_cierres ORDER BY periodo`);
+        if (request.method === "POST") {
+          const b = await request.json();
+          if (!/^\d{4}(-(0[1-9]|1[0-2]))?$/.test(b.periodo || "")) return json({ error: "Período inválido (YYYY o YYYY-MM)" }, 400);
+          if (b.cerrar === false) await sql`DELETE FROM apc_cierres WHERE periodo = ${b.periodo}`;
+          else await sql`INSERT INTO apc_cierres (periodo, cerrado_por) VALUES (${b.periodo}, ${usuarioToken}) ON CONFLICT (periodo) DO NOTHING`;
+          return json({ ok: true, periodo: b.periodo, cerrado: b.cerrar !== false });
+        }
+      }
+
       return json({ error: "Ruta no encontrada" }, 404);
     } catch (err) {
       return json({ error: err.message }, 500);
