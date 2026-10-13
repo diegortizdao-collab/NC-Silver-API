@@ -19,7 +19,10 @@ const MAILS_AUTORIZADOS = new Set([
   "gestioncalidad@silverindustrial.com.ar",
   "dortiz@escorial.com.ar",
   "controlcalidad@silverindustrial.com.ar",
-  "controldeproducion@silverindustrial.com.ar", // sic: así lo informó el usuario; confirmar ortografía
+  "controldecalidad@silverindustrial.com.ar",
+  "controldeproducion@silverindustrial.com.ar", // sic: así lo informó el usuario
+  "controldeproduccion@silverindustrial.com.ar",
+  "produccion@silverindustrial.com.ar",
   "fernando@silverindustrial.com.ar", // dueño
   "hernan@silverindustrial.com.ar", // dueño
 ]);
