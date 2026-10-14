@@ -114,6 +114,35 @@ export default {
         return json(rows);
       }
 
+      // POST /api/om/historica -> carga una OM anterior a esta app. Crea un Q.21
+      // mínimo (numero interno sintético >=100000, numero_original = el real,
+      // fecha propia) y su fila Q.25. Después se le puede subir el Word histórico
+      // desde la pestaña "Cargar Word históricos" del dashboard.
+      if (request.method === "POST" && parts[1] === "om" && parts[2] === "historica") {
+        const b = await request.json();
+        const orig = Number(b.numeroOriginal);
+        if (!orig || !b.descripcion) return json({ error: "Faltan número y descripción" }, 400);
+        const [dup] = await sql`SELECT numero FROM nc WHERE COALESCE(numero_original, numero) = ${orig} AND tipo = 'Op. de mejora'`;
+        if (dup) return json({ error: `Ya existe la OM Nº ${orig}` }, 409);
+        const [mx] = await sql`SELECT COALESCE(MAX(numero) FILTER (WHERE numero >= 100000), 100000) AS m FROM nc`;
+        const interno = Number(mx.m) + 1;
+        await sql`
+          INSERT INTO nc (numero, numero_original, tipo, categoria, producto, descripcion,
+                          fecha_produccion, disposicion, creado_por)
+          VALUES (${interno}, ${orig}, 'Op. de mejora', 'Otros', ${b.producto || "—"}, ${b.descripcion},
+                  ${b.fecha || null}, 'N/A (oportunidad de mejora)', 'Carga histórica Q.25')
+        `;
+        const [row] = await sql`
+          INSERT INTO om (nc_numero, origen, proponente, responsable, fecha_prevista,
+                          beneficio_esperado, estado, vigencia, fecha_vigencia, actualizado_en)
+          VALUES (${interno}, ${b.origen || null}, ${b.proponente || null}, ${b.responsable || null},
+                  ${b.fechaPrevista || null}, ${b.beneficioEsperado || null}, ${b.estado || null},
+                  ${b.vigencia || "Sí"}, ${b.fechaVigencia || null}, now())
+          RETURNING *
+        `;
+        return json(row, 201);
+      }
+
       // PUT /api/om/:numero -> crea o actualiza la fila Q.25 de esa OM
       if (request.method === "PUT" && parts[1] === "om" && parts[2]) {
         const numero = Number(parts[2]);
