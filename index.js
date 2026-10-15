@@ -123,21 +123,43 @@ export default {
         const orig = Number(b.numeroOriginal);
         if (!orig || !b.descripcion) return json({ error: "Faltan número y descripción" }, 400);
         const [dup] = await sql`SELECT numero FROM nc WHERE COALESCE(numero_original, numero) = ${orig} AND tipo = 'Op. de mejora'`;
-        if (dup) return json({ error: `Ya existe la OM Nº ${orig}` }, 409);
-        const [mx] = await sql`SELECT COALESCE(MAX(numero) FILTER (WHERE numero >= 100000), 100000) AS m FROM nc`;
-        const interno = Number(mx.m) + 1;
-        await sql`
-          INSERT INTO nc (numero, numero_original, tipo, categoria, producto, descripcion,
-                          fecha_produccion, disposicion, creado_por)
-          VALUES (${interno}, ${orig}, 'Op. de mejora', 'Otros', ${b.producto || "—"}, ${b.descripcion},
-                  ${b.fecha || null}, 'N/A (oportunidad de mejora)', 'Carga histórica Q.25')
-        `;
+        if (dup && !b.actualizar) return json({ error: `Ya existe la OM Nº ${orig}` }, 409);
+        let interno;
+        if (dup) {
+          // Reedición por Excel: se completan datos de una OM ya cargada
+          interno = dup.numero;
+          await sql`
+            UPDATE nc SET descripcion = ${b.descripcion},
+                          fecha_produccion = COALESCE(${b.fecha || null}, fecha_produccion),
+                          producto = COALESCE(NULLIF(${b.producto || ""}, ''), producto),
+                          actualizado_en = now()
+            WHERE numero = ${interno}
+          `;
+        } else {
+          const [mx] = await sql`SELECT COALESCE(MAX(numero) FILTER (WHERE numero >= 100000), 100000) AS m FROM nc`;
+          interno = Number(mx.m) + 1;
+          await sql`
+            INSERT INTO nc (numero, numero_original, tipo, categoria, producto, descripcion,
+                            fecha_produccion, disposicion, creado_por)
+            VALUES (${interno}, ${orig}, 'Op. de mejora', 'Otros', ${b.producto || "—"}, ${b.descripcion},
+                    ${b.fecha || null}, 'N/A (oportunidad de mejora)', 'Carga histórica Q.25')
+          `;
+        }
         const [row] = await sql`
           INSERT INTO om (nc_numero, origen, proponente, responsable, fecha_prevista,
                           beneficio_esperado, estado, vigencia, fecha_vigencia, actualizado_en)
           VALUES (${interno}, ${b.origen || null}, ${b.proponente || null}, ${b.responsable || null},
                   ${b.fechaPrevista || null}, ${b.beneficioEsperado || null}, ${b.estado || null},
                   ${b.vigencia || "Sí"}, ${b.fechaVigencia || null}, now())
+          ON CONFLICT (nc_numero) DO UPDATE SET
+            origen = COALESCE(EXCLUDED.origen, om.origen),
+            proponente = COALESCE(EXCLUDED.proponente, om.proponente),
+            responsable = COALESCE(EXCLUDED.responsable, om.responsable),
+            fecha_prevista = COALESCE(EXCLUDED.fecha_prevista, om.fecha_prevista),
+            beneficio_esperado = COALESCE(EXCLUDED.beneficio_esperado, om.beneficio_esperado),
+            estado = COALESCE(EXCLUDED.estado, om.estado),
+            fecha_vigencia = COALESCE(EXCLUDED.fecha_vigencia, om.fecha_vigencia),
+            actualizado_en = now()
           RETURNING *
         `;
         return json(row, 201);
