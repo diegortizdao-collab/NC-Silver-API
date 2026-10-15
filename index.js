@@ -159,6 +159,7 @@ export default {
             beneficio_esperado = COALESCE(EXCLUDED.beneficio_esperado, om.beneficio_esperado),
             estado = COALESCE(EXCLUDED.estado, om.estado),
             fecha_vigencia = COALESCE(EXCLUDED.fecha_vigencia, om.fecha_vigencia),
+            vigencia = COALESCE(${b.vigencia || null}, om.vigencia),
             actualizado_en = now()
           RETURNING *
         `;
@@ -169,6 +170,14 @@ export default {
       if (request.method === "PUT" && parts[1] === "om" && parts[2]) {
         const numero = Number(parts[2]);
         const b = await request.json();
+        if (b.fecha || b.descripcion) {
+          await sql`
+            UPDATE nc SET fecha_produccion = COALESCE(${b.fecha || null}, fecha_produccion),
+                          descripcion = COALESCE(NULLIF(${b.descripcion || ""}, ''), descripcion),
+                          actualizado_en = now()
+            WHERE numero = ${numero}
+          `;
+        }
         const [row] = await sql`
           INSERT INTO om (
             nc_numero, origen, proponente, responsable, fecha_prevista,
