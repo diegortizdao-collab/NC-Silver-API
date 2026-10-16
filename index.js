@@ -4,7 +4,7 @@ import { neon } from "@neondatabase/serverless";
 const ALLOWED_ORIGIN = "https://diegortizdao-collab.github.io";
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-  "Access-Control-Allow-Methods": "GET,POST,PUT,OPTIONS",
+  "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type,Authorization",
   "Vary": "Origin",
 };
@@ -39,6 +39,12 @@ const MAILS_PERSONAS = new Set([
   "gestioncalidad@silverindustrial.com.ar",
   "fernando@silverindustrial.com.ar",
   "hernan@silverindustrial.com.ar",
+]);
+// Firmas escaneadas (imágenes) para los formularios (A.14, etc.): se guardan en R2 (privado), nunca en el repo.
+// Solo estas cuentas pueden verlas, subirlas o borrarlas.
+const MAILS_FIRMAS = new Set([
+  "diegortizdao@gmail.com",
+  "gestioncalidad@silverindustrial.com.ar",
 ]);
 const TOKEN_HORAS = 12;
 
@@ -412,6 +418,48 @@ export default {
           RETURNING *
         `;
         return json(row, 201);
+      }
+
+      // ---------------------------------------------------------------------------
+      // Firmas (R2, privado): GET /api/firmas -> lista ; GET /api/firmas/:id -> PNG ;
+      // PUT /api/firmas/:id?nombre=... (cuerpo = PNG) ; DELETE /api/firmas/:id
+      // ---------------------------------------------------------------------------
+      if (parts[1] === "firmas") {
+        if (!MAILS_FIRMAS.has(usuarioToken)) return json({ error: "Acceso restringido: las firmas solo las gestiona Gestión de calidad" }, 403);
+        if (!env.NC_DOCS) return json({ error: "Falta el binding NC_DOCS (bucket R2) en este Worker" }, 500);
+        const id = parts[2];
+        if (!id) {
+          if (request.method !== "GET") return json({ error: "Método no permitido" }, 405);
+          const lista = await env.NC_DOCS.list({ prefix: "firmas/", include: ["customMetadata"] });
+          return json(lista.objects.map((o) => ({
+            id: o.key.slice("firmas/".length).replace(/\.png$/, ""),
+            nombre: (o.customMetadata && o.customMetadata.nombre) || o.key,
+            bytes: o.size,
+            subida: o.uploaded,
+          })));
+        }
+        if (!/^[a-z0-9-]{2,40}$/.test(id)) return json({ error: "Identificador de firma inválido (minúsculas, números y guiones)" }, 400);
+        const key = `firmas/${id}.png`;
+        if (request.method === "GET") {
+          const obj = await env.NC_DOCS.get(key);
+          if (!obj) return json({ error: "Firma no encontrada" }, 404);
+          return new Response(obj.body, { headers: { "Content-Type": "image/png", "Cache-Control": "private, no-store", ...CORS_HEADERS } });
+        }
+        if (request.method === "PUT") {
+          const bytes = await request.arrayBuffer();
+          const b = new Uint8Array(bytes);
+          const png = b.length > 24 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
+          if (!png) return json({ error: "El archivo debe ser una imagen PNG" }, 400);
+          if (b.length > 600 * 1024) return json({ error: "La imagen es demasiado grande (máximo 600 KB)" }, 413);
+          const nombre = (url.searchParams.get("nombre") || id).slice(0, 80);
+          await env.NC_DOCS.put(key, bytes, { httpMetadata: { contentType: "image/png" }, customMetadata: { nombre, subido_por: usuarioToken } });
+          return json({ ok: true, id, nombre });
+        }
+        if (request.method === "DELETE") {
+          await env.NC_DOCS.delete(key);
+          return json({ ok: true });
+        }
+        return json({ error: "Método no permitido" }, 405);
       }
 
       // GET /api/om -> registro Q.25 de oportunidades de mejora (une om con los
