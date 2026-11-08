@@ -527,6 +527,26 @@ export default {
         return json(fila);
       }
 
+      // PUT /api/nc/:numero/reabrir {motivo, estado?} -> reabre una NC cerrada (y descongela su documento). Solo Gestión de Calidad; el motivo es obligatorio.
+      if (request.method === "PUT" && parts[1] === "nc" && parts[2] && parts[3] === "reabrir") {
+        if (!MAILS_FIRMAS.has(usuarioToken)) return json({ error: "Solo Gestión de Calidad puede reabrir una NC cerrada." }, 403);
+        const numero = Number(parts[2]);
+        const b = await request.json();
+        const motivo = String(b.motivo || "").trim();
+        if (motivo.length < 10) return json({ error: "Indicá el motivo de la reapertura (mínimo 10 caracteres): queda en el historial." }, 400);
+        const estado = ["Abierta", "En análisis", "En verificación"].includes(b.estado) ? b.estado : "En verificación";
+        const [nc] = await sql`SELECT numero, documento_congelado FROM nc WHERE numero = ${numero}`;
+        if (!nc) return json({ error: "NC no encontrada" }, 404);
+        const [an] = await sql`SELECT estado FROM nc_analisis WHERE nc_numero = ${numero}`;
+        if (!nc.documento_congelado && !(an && an.estado === "Cerrada")) return json({ error: "La NC no está cerrada." }, 409);
+        if (an) await sql`UPDATE nc_analisis SET estado = ${estado}, actualizado_en = now() WHERE nc_numero = ${numero}`;
+        else await sql`INSERT INTO nc_analisis (nc_numero, estado, actualizado_en) VALUES (${numero}, ${estado}, now())`;
+        await sql`UPDATE nc SET documento_congelado = false, actualizado_en = now() WHERE numero = ${numero}`;
+        await logHist(sql, numero, "estado", "Cerrada", estado, usuarioToken, null, "Reapertura: " + motivo);
+        if (nc.documento_congelado) await logHist(sql, numero, "documento Q.21", "congelado", "descongelado", usuarioToken, null, "Reapertura: " + motivo);
+        return json({ ok: true, estado });
+      }
+
       // PUT /api/nc/:numero/cumplimiento {cumplido: "Sí"|"No", fechaCumplimiento} -> marca la disposición / acción inmediata como cumplida
       if (request.method === "PUT" && parts[1] === "nc" && parts[2] && parts[3] === "cumplimiento") {
         const numero = Number(parts[2]);
