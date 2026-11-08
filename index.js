@@ -490,7 +490,9 @@ export default {
         const b = await request.json();
         const [nc] = await sql`SELECT * FROM nc WHERE numero = ${numero}`;
         if (!nc) return json({ error: "NC no encontrada" }, 404);
-        if (nc.documento_congelado) return json({ error: "La NC está cerrada: su documento está congelado y no se puede modificar." }, 409);
+        // Gestión de Calidad puede corregir datos de una NC cerrada/congelada sin reabrirla (b.forzar): queda constancia en el historial y sigue congelada.
+        const corrigeCerrada = !!nc.documento_congelado;
+        if (corrigeCerrada && !(b.forzar && MAILS_FIRMAS.has(usuarioToken))) return json({ error: "La NC está cerrada: su documento está congelado. Solo Gestión de Calidad puede corregir sus datos." }, 409);
         const txtv = (v, max = 4000) => (v == null || String(v).trim() === "" ? null : String(v).trim().slice(0, max));
         const nuevo = {
           cliente: b.cliente !== undefined ? txtv(b.cliente, 200) : nc.cliente,
@@ -517,7 +519,7 @@ export default {
                   maquina = ${nuevo.maquina}, oti = ${nuevo.oti}, cantidad_piezas = ${nuevo.cantidad_piezas}, disposicion = ${nuevo.disposicion},
                   fecha_produccion = ${fp}, fecha_programada = ${fprog}, cargado_por_apellido = ${cpAp}, cargado_por_nombre = ${cpNo}, actualizado_en = now()
                   WHERE numero = ${numero}`;
-        const usuario = b.usuario || usuarioToken, motivo = b.motivo || "Completado de datos del registro";
+        const usuario = b.usuario || usuarioToken, motivo = b.motivo || (corrigeCerrada ? "Corrección de datos en NC cerrada (Gestión de Calidad)" : "Completado de datos del registro");
         const cambios = [["cliente", nc.cliente, nuevo.cliente], ["producto", nc.producto, nuevo.producto], ["descripción", nc.descripcion, nuevo.descripcion],
           ["operario", nc.operario, nuevo.operario], ["máquina", nc.maquina, nuevo.maquina], ["OTI", nc.oti, nuevo.oti], ["cantidad de piezas", nc.cantidad_piezas, nuevo.cantidad_piezas],
           ["disposición / acción inmediata", nc.disposicion, nuevo.disposicion], ["fecha del hecho", d10(nc.fecha_produccion), fp], ["fecha programada", d10(nc.fecha_programada), fprog],
