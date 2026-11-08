@@ -138,6 +138,8 @@ function fechaSQL(v) {
   const d = new Date(t);
   return isNaN(d) ? undefined : d.toISOString().slice(0, 10);
 }
+// Fecha de la base (Date de pg o texto) -> "YYYY-MM-DD" (nunca String(Date): daba "Sat May 30")
+function d10(v) { if (!v) return null; return v instanceof Date ? v.toISOString().slice(0, 10) : String(v).slice(0, 10); }
 function hoyAR() { return new Date(Date.now() - 3 * 3600 * 1000).toISOString().slice(0, 10); }
 async function logHist(sql, numero, campo, ant, nuevo, usuario, fechaHecho, motivo) {
   await sql`INSERT INTO nc_historial (nc_numero, campo, valor_anterior, valor_nuevo, usuario, fecha_hecho, motivo)
@@ -145,7 +147,7 @@ async function logHist(sql, numero, campo, ant, nuevo, usuario, fechaHecho, moti
 }
 // Si alguna fecha del hecho es anterior a hoy, el registro es posterior al hecho: se deja constancia automática.
 function motivoAuto(fechasHecho, hoy) {
-  return fechasHecho.some((f) => f && String(f).slice(0, 10) < hoy) ? "Registro posterior a la fecha del hecho" : null;
+  return fechasHecho.some((f) => f && d10(f) < hoy) ? "Registro posterior a la fecha del hecho" : null;
 }
 // Condiciones para pasar una NC a "Cerrada". Devuelve el texto del error o null.
 function errorCierre(nc, an) {
@@ -441,7 +443,6 @@ export default {
         if (nc.documento_congelado) return json({ error: "La NC está cerrada: su documento está congelado y no se puede modificar." }, 409);
         const [an] = await sql`SELECT * FROM nc_analisis WHERE nc_numero = ${numero}`;
         const hoy = hoyAR();
-        const d10 = (v) => (v ? String(v).slice(0, 10) : null);
         const requiere = b.requiereAccion !== undefined ? b.requiereAccion : nc.requiere_accion;
         const cumplido = b.cumplido !== undefined ? b.cumplido : nc.cumplido;
         const fechaCump = cumplido === "Sí" ? (b.fechaCumplimiento !== undefined ? d10(b.fechaCumplimiento) : d10(nc.fecha_cumplimiento)) : null;
@@ -488,7 +489,7 @@ export default {
         await sql`
           INSERT INTO nc_historial (nc_numero, campo, valor_anterior, valor_nuevo, usuario, fecha_hecho, motivo)
           VALUES (${numero}, 'acción cumplida',
-                  ${(previo.cumplido || "—") + (previo.fecha_cumplimiento ? " (" + String(previo.fecha_cumplimiento).slice(0, 10) + ")" : "")},
+                  ${(previo.cumplido || "—") + (previo.fecha_cumplimiento ? " (" + d10(previo.fecha_cumplimiento) + ")" : "")},
                   ${b.cumplido + (fecha ? " (" + fecha + ")" : "")},
                   ${b.usuario || usuarioToken}, ${fecha}, ${b.motivo || motivoAuto([fecha], hoyAR())})
         `;
@@ -551,7 +552,7 @@ export default {
         `;
 
         const usuarioH = b.usuario || usuarioToken;
-        const d10a = (v) => (v ? String(v).slice(0, 10) : null);
+        const d10a = d10;
         const motivoA = b.motivo || motivoAuto([d10a(row.fecha_verif_cumplimiento) !== d10a(previo && previo.fecha_verif_cumplimiento) ? row.fecha_verif_cumplimiento : null, d10a(row.fecha_verif_eficacia) !== d10a(previo && previo.fecha_verif_eficacia) ? row.fecha_verif_eficacia : null], hoy);
         if (!previo || previo.estado !== row.estado) await logHist(sql, numero, "estado", previo ? previo.estado : null, row.estado, usuarioH, row.estado === "Cerrada" ? hoy : null, motivoA);
         for (const [campo, col, esFecha] of [
@@ -896,7 +897,6 @@ export default {
         if (nc.documento_congelado) return json({ error: "La OM está cerrada: su documento está congelado y no se puede modificar." }, 409);
         const [prev] = await sql`SELECT * FROM om WHERE nc_numero = ${numero}`;
         const hoy = hoyAR();
-        const d10 = (v) => (v ? String(v).slice(0, 10) : null);
         const pick = (k, col) => (b[k] !== undefined ? (b[k] === "" ? null : b[k]) : prev ? prev[col] : null);
         const f = {
           aprobada: pick("aprobada", "aprobada"), necesidad: pick("necesidad", "necesidad"), impacto: pick("impacto", "impacto"), meta: pick("meta", "meta"),
