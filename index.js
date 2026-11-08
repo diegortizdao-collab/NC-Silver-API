@@ -395,6 +395,30 @@ export default {
         return json(row);
       }
 
+      // PUT /api/nc/:numero/cumplimiento {cumplido: "Sí"|"No", fechaCumplimiento} -> marca la disposición / acción inmediata como cumplida
+      if (request.method === "PUT" && parts[1] === "nc" && parts[2] && parts[3] === "cumplimiento") {
+        const numero = Number(parts[2]);
+        const b = await request.json();
+        if (!["Sí", "No"].includes(b.cumplido)) return json({ error: "Indicá si la acción fue cumplida (Sí / No)" }, 400);
+        const fecha = b.cumplido === "Sí" ? (String(b.fechaCumplimiento || "").slice(0, 10) || null) : null;
+        if (fecha && !/^\d{4}-\d{2}-\d{2}$/.test(fecha)) return json({ error: "Fecha de cumplimiento inválida" }, 400);
+        const [previo] = await sql`SELECT cumplido, fecha_cumplimiento, documento_congelado FROM nc WHERE numero = ${numero}`;
+        if (!previo) return json({ error: "NC no encontrada" }, 404);
+        if (previo.documento_congelado) return json({ error: "La NC está cerrada: su documento está congelado y no se puede modificar." }, 409);
+        const [row] = await sql`
+          UPDATE nc SET cumplido = ${b.cumplido}, fecha_cumplimiento = ${fecha}, actualizado_en = now()
+          WHERE numero = ${numero} RETURNING *
+        `;
+        await sql`
+          INSERT INTO nc_historial (nc_numero, campo, valor_anterior, valor_nuevo, usuario)
+          VALUES (${numero}, 'acción cumplida',
+                  ${(previo.cumplido || "—") + (previo.fecha_cumplimiento ? " (" + String(previo.fecha_cumplimiento).slice(0, 10) + ")" : "")},
+                  ${b.cumplido + (fecha ? " (" + fecha + ")" : "")},
+                  ${b.usuario || usuarioToken})
+        `;
+        return json(row);
+      }
+
       // PUT /api/nc/:numero/analisis -> crea o actualiza el Bloque 2
       if (request.method === "PUT" && parts[1] === "nc" && parts[2] && parts[3] === "analisis") {
         const numero = Number(parts[2]);
