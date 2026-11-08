@@ -46,6 +46,15 @@ const MAILS_FIRMAS = new Set([
   "diegortizdao@gmail.com",
   "gestioncalidad@silverindustrial.com.ar",
 ]);
+// Reclamos (A.03 / A.37): ingresan con nombre completo + clave compartida (secret RECLAMOS_PASSWORD).
+// Solo "edita" puede crear y modificar; los demás ven y descargan.
+const RECLAMOS_USUARIOS = {
+  "diego ortiz": { nombre: "Diego Ortiz", edita: true },
+  "fernando nieto": { nombre: "Fernando Nieto", edita: false },
+  "hernan nieto": { nombre: "Hernán Nieto", edita: false },
+};
+const EDITORES_RECLAMOS_MAIL = new Set(["diegortizdao@gmail.com"]); // la cuenta general de Diego también edita
+const normNombre = (t) => String(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
 const TOKEN_HORAS = 12;
 
 // Tipos de informe con numeración propia (PR.05 Rev. 6). El número interno es offset+n para no chocar
@@ -98,7 +107,12 @@ async function verificarToken(token, authSecret) {
   if (!(await iguales(firma, await hmac(authSecret, payload)))) return null;
   try {
     const d = JSON.parse(unb64uStr(payload));
-    if (!d.exp || d.exp < Date.now() || !(MAILS_AUTORIZADOS.has(d.email) || MAILS_RRHH.has(d.email))) return null;
+    if (!d.exp || d.exp < Date.now()) return null;
+    if (typeof d.email === "string" && d.email.startsWith("rec:")) {
+      const u = RECLAMOS_USUARIOS[normNombre(d.email.slice(4))];
+      return u ? "rec:" + u.nombre : null;
+    }
+    if (!(MAILS_AUTORIZADOS.has(d.email) || MAILS_RRHH.has(d.email))) return null;
     return d.email;
   } catch {
     return null;
@@ -120,6 +134,22 @@ export default {
 
     const url = new URL(request.url);
     const parts = url.pathname.split("/").filter(Boolean); // ["api","nc", ...]
+
+    // POST /api/reclamos/login {nombre, password} -> {token, usuario, edita}
+    if (request.method === "POST" && parts[0] === "api" && parts[1] === "reclamos" && parts[2] === "login") {
+      const authSecret = await secreto(env.AUTH_SECRET);
+      const clave = await secreto(env.RECLAMOS_PASSWORD);
+      if (!authSecret || !clave) return json({ error: "Acceso a Reclamos no configurado en el Worker (falta el secret RECLAMOS_PASSWORD)" }, 500);
+      let b = {};
+      try { b = await request.json(); } catch {}
+      const u = RECLAMOS_USUARIOS[normNombre(b.nombre)];
+      const okPass = !!u && (await iguales(String(b.password || ""), clave));
+      if (!okPass) {
+        await new Promise((r) => setTimeout(r, 600));
+        return json({ error: "Nombre completo o contraseña incorrectos" }, 401);
+      }
+      return json({ token: await emitirToken("rec:" + u.nombre, authSecret), usuario: u.nombre, edita: u.edita, expira: Date.now() + TOKEN_HORAS * 3600 * 1000 });
+    }
 
     // POST /api/login {email, password} -> {token, email, expira}
     if (request.method === "POST" && parts[0] === "api" && parts[1] === "login") {
@@ -144,6 +174,11 @@ export default {
     const authSecret = await secreto(env.AUTH_SECRET);
     const usuarioToken = await verificarToken((request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, ""), authSecret);
     if (!usuarioToken) return json({ error: "No autorizado" }, 401);
+
+    // Cuentas de Reclamos (nombre + clave): solo /api/reclamos/*
+    if (usuarioToken.startsWith("rec:") && !(parts[0] === "api" && parts[1] === "reclamos")) {
+      return json({ error: "Acceso restringido: esta cuenta solo accede a Reclamos" }, 403);
+    }
 
     // Cuentas de RRHH: solo pueden guardar ausentismo (y nada más).
     let rrhhBody = null;
@@ -418,6 +453,205 @@ export default {
           RETURNING *
         `;
         return json(row, 201);
+      }
+
+      // ---------------------------------------------------------------------------
+      // Reclamos (A.03 registro + A.37 informe). Ver db/005_reclamos.sql
+      //  GET  /api/reclamos/yo | GET /api/reclamos | GET /api/reclamos/proximo | GET /api/reclamos/nc-pendientes
+      //  POST /api/reclamos | PUT /api/reclamos/importar | PUT /api/reclamos/:numero
+      //  GET/PUT /api/reclamos/:numero/a37 (Word original en R2) | GET /api/reclamos/:numero/historial
+      // Ver y descargar: cualquier cuenta con acceso. Crear/editar/importar: solo quien "edita" (Diego Ortiz).
+      // ---------------------------------------------------------------------------
+      if (parts[1] === "reclamos") {
+        const esRec = usuarioToken.startsWith("rec:");
+        const quien = esRec ? usuarioToken.slice(4) : usuarioToken;
+        const edita = esRec ? !!RECLAMOS_USUARIOS[normNombre(quien)]?.edita : EDITORES_RECLAMOS_MAIL.has(usuarioToken);
+        const sinPermiso = () => json({ error: "Solo Diego Ortiz puede crear o modificar reclamos" }, 403);
+        const reNumero = /^\d{1,5}(-[a-z])?$/i;
+        const txt = (v, max = 4000) => (v == null || String(v).trim() === "" ? null : String(v).trim().slice(0, max));
+        const tri = (v) => (v === true || v === false ? v : null);
+        const claveA37 = (n) => `reclamos/a37/${n}.docx`;
+        // Valida y normaliza un reclamo; devuelve {error} o {r}
+        const limpiar = (b, parcial = false) => {
+          const r = {};
+          if (!parcial || "numero" in b) {
+            const n = String(b.numero ?? "").trim().toLowerCase();
+            if (!reNumero.test(n)) return { error: `Número inválido: "${b.numero}"` };
+            r.numero = n;
+            r.num = parseInt(n, 10);
+          }
+          if (!parcial || "fecha" in b) {
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(String(b.fecha || "")) || isNaN(Date.parse(b.fecha))) return { error: `Fecha inválida en el reclamo ${b.numero ?? ""}` };
+            r.fecha = b.fecha;
+          }
+          if (!parcial || "cliente" in b) { r.cliente = txt(b.cliente, 200); if (!r.cliente) return { error: `Falta el cliente en el reclamo ${b.numero ?? ""}` }; }
+          if (!parcial || "motivo" in b) { r.motivo = txt(b.motivo, 4000); if (!r.motivo) return { error: `Falta el motivo en el reclamo ${b.numero ?? ""}` }; }
+          if (!parcial || "tipo" in b) { r.tipo = b.tipo === "Proveedor" ? "Proveedor" : "Cliente"; }
+          for (const [k, max] of [["oti", 120], ["producto", 300], ["cantidad", 120], ["accion_inmediata", 4000], ["observaciones", 4000], ["medio", 200], ["cant_devuelta", 300]]) {
+            if (!parcial || k in b) r[k] = txt(b[k], max);
+          }
+          for (const k of ["pertinente", "significativo", "devolucion"]) if (!parcial || k in b) r[k] = tri(b[k]);
+          if (!parcial || "nc_numeros" in b) {
+            r.nc_numeros = [...new Set((Array.isArray(b.nc_numeros) ? b.nc_numeros : []).map(Number).filter((x) => Number.isInteger(x) && x > 0 && x < 100000))].slice(0, 30);
+          }
+          if (!parcial || "a37" in b) {
+            const a = b.a37 && typeof b.a37 === "object" && !Array.isArray(b.a37) ? b.a37 : {};
+            if (JSON.stringify(a).length > 30000) return { error: "El A.37 es demasiado grande" };
+            r.a37 = a;
+          }
+          return { r };
+        };
+
+        if (request.method === "GET" && parts[2] === "yo") return json({ usuario: quien, edita });
+
+        if (request.method === "GET" && !parts[2]) {
+          const rows = await sql`SELECT * FROM reclamos ORDER BY num DESC, numero DESC`;
+          return json(rows);
+        }
+
+        if (request.method === "GET" && parts[2] === "proximo") {
+          const [x] = await sql`SELECT GREATEST(COALESCE(MAX(num), 0), 593) + 1 AS siguiente FROM reclamos`;
+          return json({ numero: String(x.siguiente) });
+        }
+
+        // NC de reclamos (clientes o proveedores) que todavía no están vinculadas a ningún reclamo del A.03
+        if (request.method === "GET" && parts[2] === "nc-pendientes") {
+          const rows = await sql`
+            SELECT COALESCE(n.numero_original, n.numero) AS nc, n.cliente, n.producto, n.descripcion, n.oti,
+                   n.cantidad_piezas, n.clasificacion, n.con_devolucion, n.fecha_produccion AS fecha, n.creado_en
+            FROM nc n
+            WHERE n.clasificacion IN ('Reclamos de Clientes', 'Proveedores')
+              AND NOT EXISTS (SELECT 1 FROM reclamos r WHERE COALESCE(n.numero_original, n.numero) = ANY (r.nc_numeros))
+            ORDER BY n.fecha_produccion DESC NULLS LAST, 1 DESC
+            LIMIT 400
+          `;
+          return json(rows);
+        }
+
+        if (request.method === "POST" && !parts[2]) {
+          if (!edita) return sinPermiso();
+          const b = await request.json().catch(() => ({}));
+          if (!b.numero) {
+            const [x] = await sql`SELECT GREATEST(COALESCE(MAX(num), 0), 593) + 1 AS siguiente FROM reclamos`;
+            b.numero = String(x.siguiente);
+          }
+          const { r, error } = limpiar(b);
+          if (error) return json({ error }, 400);
+          const [dup] = await sql`SELECT numero FROM reclamos WHERE numero = ${r.numero}`;
+          if (dup) return json({ error: `Ya existe el reclamo Nº ${r.numero}` }, 409);
+          const [row] = await sql`
+            INSERT INTO reclamos (numero, num, fecha, cliente, tipo, oti, producto, cantidad, motivo, pertinente, significativo,
+              accion_inmediata, observaciones, medio, devolucion, cant_devuelta, nc_numeros, a37, creado_por, actualizado_por)
+            VALUES (${r.numero}, ${r.num}, ${r.fecha}, ${r.cliente}, ${r.tipo}, ${r.oti}, ${r.producto}, ${r.cantidad}, ${r.motivo},
+              ${r.pertinente}, ${r.significativo}, ${r.accion_inmediata}, ${r.observaciones}, ${r.medio}, ${r.devolucion},
+              ${r.cant_devuelta}, ${r.nc_numeros}, ${JSON.stringify(r.a37)}::jsonb, ${quien}, ${quien})
+            RETURNING *`;
+          await sql`INSERT INTO reclamos_historial (numero, campo, antes, despues, usuario) VALUES (${r.numero}, 'creación', NULL, 'Reclamo creado', ${quien})`;
+          return json(row, 201);
+        }
+
+        // PUT /api/reclamos/importar {reclamos:[...], sobrescribir?:bool} -> una sola consulta (límite de subrequests de Cloudflare)
+        if (request.method === "PUT" && parts[2] === "importar") {
+          if (!edita) return sinPermiso();
+          const b = await request.json().catch(() => ({}));
+          const lista = Array.isArray(b.reclamos) ? b.reclamos : [];
+          if (!lista.length) return json({ error: "No hay reclamos para importar" }, 400);
+          if (lista.length > 700) return json({ error: "Demasiados reclamos en un pedido (máx. 700)" }, 400);
+          const validos = [], rechazados = [];
+          for (const x of lista) {
+            const { r, error } = limpiar(x);
+            if (error) rechazados.push({ numero: x && x.numero, error });
+            else validos.push({ ...r, a37: undefined });
+          }
+          if (!validos.length) return json({ guardados: 0, rechazados }, 200);
+          const js = JSON.stringify(validos);
+          const filas = b.sobrescribir
+            ? await sql`
+              INSERT INTO reclamos (numero, num, fecha, cliente, tipo, oti, producto, cantidad, motivo, pertinente, significativo,
+                accion_inmediata, observaciones, medio, devolucion, cant_devuelta, nc_numeros, creado_por, actualizado_por)
+              SELECT x.numero, x.num, x.fecha::date, x.cliente, x.tipo, x.oti, x.producto, x.cantidad, x.motivo, x.pertinente, x.significativo,
+                     x.accion_inmediata, x.observaciones, x.medio, x.devolucion, x.cant_devuelta, COALESCE(x.nc_numeros, '{}'), ${quien}, ${quien}
+              FROM jsonb_to_recordset(${js}::jsonb) AS x(numero text, num int, fecha text, cliente text, tipo text, oti text, producto text,
+                   cantidad text, motivo text, pertinente boolean, significativo boolean, accion_inmediata text, observaciones text,
+                   medio text, devolucion boolean, cant_devuelta text, nc_numeros int[])
+              ON CONFLICT (numero) DO UPDATE SET fecha = EXCLUDED.fecha, cliente = EXCLUDED.cliente, tipo = EXCLUDED.tipo, oti = EXCLUDED.oti,
+                producto = EXCLUDED.producto, cantidad = EXCLUDED.cantidad, motivo = EXCLUDED.motivo, pertinente = EXCLUDED.pertinente,
+                significativo = EXCLUDED.significativo, accion_inmediata = EXCLUDED.accion_inmediata, observaciones = EXCLUDED.observaciones,
+                medio = EXCLUDED.medio, devolucion = EXCLUDED.devolucion, cant_devuelta = EXCLUDED.cant_devuelta,
+                nc_numeros = EXCLUDED.nc_numeros, actualizado_por = ${quien}, actualizado_en = now()
+              RETURNING numero, (xmax = 0) AS nuevo`
+            : await sql`
+              INSERT INTO reclamos (numero, num, fecha, cliente, tipo, oti, producto, cantidad, motivo, pertinente, significativo,
+                accion_inmediata, observaciones, medio, devolucion, cant_devuelta, nc_numeros, creado_por, actualizado_por)
+              SELECT x.numero, x.num, x.fecha::date, x.cliente, x.tipo, x.oti, x.producto, x.cantidad, x.motivo, x.pertinente, x.significativo,
+                     x.accion_inmediata, x.observaciones, x.medio, x.devolucion, x.cant_devuelta, COALESCE(x.nc_numeros, '{}'), ${quien}, ${quien}
+              FROM jsonb_to_recordset(${js}::jsonb) AS x(numero text, num int, fecha text, cliente text, tipo text, oti text, producto text,
+                   cantidad text, motivo text, pertinente boolean, significativo boolean, accion_inmediata text, observaciones text,
+                   medio text, devolucion boolean, cant_devuelta text, nc_numeros int[])
+              ON CONFLICT (numero) DO NOTHING
+              RETURNING numero, true AS nuevo`;
+          return json({ guardados: filas.length, nuevos: filas.filter((f) => f.nuevo).length, existentes: validos.length - filas.length, rechazados });
+        }
+
+        const numero = String(parts[2] || "").toLowerCase();
+        if (!reNumero.test(numero)) return json({ error: "Número de reclamo inválido" }, 400);
+
+        // A.37 Word original (histórico) en R2
+        if (parts[3] === "a37") {
+          if (!env.NC_DOCS) return json({ error: "Falta el binding R2 NC_DOCS" }, 500);
+          if (request.method === "GET") {
+            const obj = await env.NC_DOCS.get(claveA37(numero));
+            if (!obj) return json({ error: "Este reclamo no tiene un A.37 guardado" }, 404);
+            return new Response(obj.body, { headers: { "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "Cache-Control": "private, no-store", ...CORS_HEADERS } });
+          }
+          if (request.method === "PUT") {
+            if (!edita) return sinPermiso();
+            const bytes = new Uint8Array(await request.arrayBuffer());
+            if (bytes.length < 1000 || bytes.length > 4 * 1024 * 1024) return json({ error: "El archivo debe pesar menos de 4 MB" }, 400);
+            if (!(bytes[0] === 0x50 && bytes[1] === 0x4b)) return json({ error: "No es un .docx válido" }, 400);
+            const [ex] = await sql`SELECT numero FROM reclamos WHERE numero = ${numero}`;
+            if (!ex) return json({ error: `El reclamo ${numero} no existe: importá primero el A.03` }, 404);
+            await env.NC_DOCS.put(claveA37(numero), bytes, { httpMetadata: { contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }, customMetadata: { subido_por: quien } });
+            await sql`UPDATE reclamos SET a37_key = ${claveA37(numero)}, a37_origen = 'original', actualizado_por = ${quien}, actualizado_en = now() WHERE numero = ${numero}`;
+            await sql`INSERT INTO reclamos_historial (numero, campo, antes, despues, usuario) VALUES (${numero}, 'A.37', NULL, 'Word original guardado', ${quien})`;
+            return json({ ok: true, numero, bytes: bytes.length });
+          }
+        }
+
+        if (request.method === "GET" && parts[3] === "historial") {
+          return json(await sql`SELECT campo, antes, despues, usuario, fecha FROM reclamos_historial WHERE numero = ${numero} ORDER BY id DESC LIMIT 200`);
+        }
+
+        if (request.method === "GET" && !parts[3]) {
+          const [row] = await sql`SELECT * FROM reclamos WHERE numero = ${numero}`;
+          return row ? json(row) : json({ error: "No existe ese reclamo" }, 404);
+        }
+
+        if (request.method === "PUT" && !parts[3]) {
+          if (!edita) return sinPermiso();
+          const b = await request.json().catch(() => ({}));
+          delete b.numero;
+          const { r, error } = limpiar(b, true);
+          if (error) return json({ error }, 400);
+          const [prev] = await sql`SELECT * FROM reclamos WHERE numero = ${numero}`;
+          if (!prev) return json({ error: "No existe ese reclamo" }, 404);
+          const m = { ...prev, ...r };
+          const [row] = await sql`
+            UPDATE reclamos SET fecha = ${m.fecha}, cliente = ${m.cliente}, tipo = ${m.tipo}, oti = ${m.oti}, producto = ${m.producto},
+              cantidad = ${m.cantidad}, motivo = ${m.motivo}, pertinente = ${m.pertinente}, significativo = ${m.significativo},
+              accion_inmediata = ${m.accion_inmediata}, observaciones = ${m.observaciones}, medio = ${m.medio}, devolucion = ${m.devolucion},
+              cant_devuelta = ${m.cant_devuelta}, nc_numeros = ${m.nc_numeros}, a37 = ${JSON.stringify(m.a37 || {})}::jsonb,
+              actualizado_por = ${quien}, actualizado_en = now()
+            WHERE numero = ${numero} RETURNING *`;
+          const norm = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : v == null ? null : typeof v === "object" ? JSON.stringify(v).slice(0, 500) : String(v).slice(0, 500));
+          const cambios = Object.keys(r).filter((k) => norm(prev[k]) !== norm(r[k]));
+          for (const k of cambios.slice(0, 20)) {
+            await sql`INSERT INTO reclamos_historial (numero, campo, antes, despues, usuario) VALUES (${numero}, ${k}, ${norm(prev[k])}, ${norm(r[k])}, ${quien})`;
+          }
+          return json(row);
+        }
+
+        return json({ error: "Ruta de reclamos no encontrada" }, 404);
       }
 
       // ---------------------------------------------------------------------------
