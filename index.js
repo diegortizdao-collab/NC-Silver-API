@@ -341,7 +341,8 @@ export default {
         const [analisis] = await sql`SELECT * FROM nc_analisis WHERE nc_numero = ${numero}`;
         const notificaciones = await sql`SELECT * FROM nc_notificaciones WHERE nc_numero = ${numero}`;
         const historial = await sql`SELECT id, campo, valor_anterior, valor_nuevo, usuario, fecha, fecha_hecho, motivo FROM nc_historial WHERE nc_numero = ${numero} ORDER BY fecha DESC, id DESC`;
-        return json({ ...nc, analisis: analisis || null, notificaciones, historial });
+        const [om] = await sql`SELECT * FROM om WHERE nc_numero = ${numero}`;
+        return json({ ...nc, analisis: analisis || null, notificaciones, historial, om: om || null });
       }
 
       // POST /api/nc -> crea una NC nueva (Bloque 1)
@@ -867,6 +868,76 @@ export default {
           RETURNING *
         `;
         return json(row, 201);
+      }
+
+      // PUT /api/om/:numero/gestion -> ciclo de vida de la OM (Q.21.B): aprobación, plan, implementación y
+      // verificación de vigencia a los 6 meses. Solo toca los campos que vienen en el cuerpo.
+      // Cierre: implementada con evidencia + verificación de vigencia con fecha >= implementación + 6 meses y "sigue vigente".
+      if (request.method === "PUT" && parts[1] === "om" && parts[2] && parts[3] === "gestion") {
+        const numero = Number(parts[2]);
+        const b = await request.json();
+        const [nc] = await sql`SELECT numero, documento_congelado FROM nc WHERE numero = ${numero} AND tipo = ${TIPO_OM}`;
+        if (!nc) return json({ error: "OM no encontrada" }, 404);
+        if (nc.documento_congelado) return json({ error: "La OM está cerrada: su documento está congelado y no se puede modificar." }, 409);
+        const [prev] = await sql`SELECT * FROM om WHERE nc_numero = ${numero}`;
+        const hoy = hoyAR();
+        const d10 = (v) => (v ? String(v).slice(0, 10) : null);
+        const pick = (k, col) => (b[k] !== undefined ? (b[k] === "" ? null : b[k]) : prev ? prev[col] : null);
+        const f = {
+          aprobada: pick("aprobada", "aprobada"), necesidad: pick("necesidad", "necesidad"), impacto: pick("impacto", "impacto"), meta: pick("meta", "meta"),
+          plan: pick("plan", "plan"), origen: pick("origen", "origen"), proponente: pick("proponente", "proponente"), responsable: pick("responsable", "responsable"),
+          fecha_prevista: d10(pick("fechaPrevista", "fecha_prevista")), beneficio_esperado: pick("beneficioEsperado", "beneficio_esperado"),
+          fecha_implementacion: d10(pick("fechaImplementacion", "fecha_implementacion")),
+          fecha_verif_implementacion: d10(pick("fechaVerifImplementacion", "fecha_verif_implementacion")),
+          evidencia_implementacion: pick("evidenciaImplementacion", "evidencia_implementacion"),
+          vigencia: pick("vigencia", "vigencia"), fecha_vigencia: d10(pick("fechaVigencia", "fecha_vigencia")), evidencia_vigencia: pick("evidenciaVigencia", "evidencia_vigencia"),
+          estado: pick("estado", "estado"),
+        };
+        for (const [k, rot] of [["fecha_implementacion", "implementación"], ["fecha_verif_implementacion", "verificación de la implementación"], ["fecha_vigencia", "verificación de vigencia"]]) {
+          if (f[k] && (!/^\d{4}-\d{2}-\d{2}$/.test(f[k]) || f[k] > hoy)) return json({ error: `La fecha de ${rot} es inválida o futura: tiene que ser la fecha real del hecho.` }, 400);
+        }
+        let cerradaEn = prev ? d10(prev.cerrada_en) : null, motivoCierre = prev ? prev.motivo_cierre : null;
+        if (b.cerrar) {
+          if (f.aprobada !== "Sí") return json({ error: "Para cerrar la OM, tiene que estar aprobada (Sí)." }, 400);
+          if (!f.fecha_implementacion || !f.evidencia_implementacion) return json({ error: "Para cerrar la OM falta la implementación (fecha y evidencia)." }, 400);
+          if (!f.fecha_vigencia || !f.evidencia_vigencia) return json({ error: "Para cerrar la OM falta la verificación de vigencia a los 6 meses (fecha y evidencia)." }, 400);
+          const minimo = new Date(f.fecha_implementacion + "T00:00:00Z"); minimo.setUTCMonth(minimo.getUTCMonth() + 6);
+          if (f.fecha_vigencia < minimo.toISOString().slice(0, 10)) return json({ error: `La verificación de vigencia tiene que ser a los 6 meses o más de la implementación (desde el ${minimo.toISOString().slice(0, 10)}).` }, 400);
+          if (f.vigencia !== "Sí") return json({ error: "Para cerrar, la mejora tiene que seguir implementada (vigencia = Sí). Si dejó de aplicarse, reabrila o discontinuala." }, 400);
+          cerradaEn = hoy; motivoCierre = "Mejora implementada y vigente a los 6 meses";
+        } else if (b.discontinuar) {
+          if (!b.motivoCierre) return json({ error: "Indicá el motivo por el que se discontinúa la OM." }, 400);
+          cerradaEn = hoy; motivoCierre = "Discontinuada: " + b.motivoCierre; f.vigencia = "No";
+        } else if (b.reabrir) { cerradaEn = null; motivoCierre = null; }
+        const usuario = b.usuario || usuarioToken;
+        const motivo = b.motivo || motivoAuto([f.fecha_implementacion, f.fecha_verif_implementacion, f.fecha_vigencia].filter((x, i) => x && x !== d10(prev && [prev.fecha_implementacion, prev.fecha_verif_implementacion, prev.fecha_vigencia][i])), hoy);
+        const [row] = await sql`
+          INSERT INTO om (nc_numero, origen, proponente, responsable, fecha_prevista, beneficio_esperado, estado, vigencia, fecha_vigencia, aprobada, necesidad, impacto, meta, plan,
+                          fecha_implementacion, fecha_verif_implementacion, evidencia_implementacion, evidencia_vigencia, cerrada_en, motivo_cierre, actualizado_en)
+          VALUES (${numero}, ${f.origen}, ${f.proponente}, ${f.responsable}, ${f.fecha_prevista}, ${f.beneficio_esperado}, ${f.estado}, ${f.vigencia}, ${f.fecha_vigencia}, ${f.aprobada}, ${f.necesidad}, ${f.impacto}, ${f.meta}, ${f.plan},
+                  ${f.fecha_implementacion}, ${f.fecha_verif_implementacion}, ${f.evidencia_implementacion}, ${f.evidencia_vigencia}, ${cerradaEn}, ${motivoCierre}, now())
+          ON CONFLICT (nc_numero) DO UPDATE SET
+            origen = EXCLUDED.origen, proponente = EXCLUDED.proponente, responsable = EXCLUDED.responsable, fecha_prevista = EXCLUDED.fecha_prevista,
+            beneficio_esperado = EXCLUDED.beneficio_esperado, estado = EXCLUDED.estado, vigencia = EXCLUDED.vigencia, fecha_vigencia = EXCLUDED.fecha_vigencia,
+            aprobada = EXCLUDED.aprobada, necesidad = EXCLUDED.necesidad, impacto = EXCLUDED.impacto, meta = EXCLUDED.meta, plan = EXCLUDED.plan,
+            fecha_implementacion = EXCLUDED.fecha_implementacion, fecha_verif_implementacion = EXCLUDED.fecha_verif_implementacion,
+            evidencia_implementacion = EXCLUDED.evidencia_implementacion, evidencia_vigencia = EXCLUDED.evidencia_vigencia,
+            cerrada_en = EXCLUDED.cerrada_en, motivo_cierre = EXCLUDED.motivo_cierre, actualizado_en = now()
+          RETURNING *
+        `;
+        const seguimiento = [
+          ["aprobada", "mejora aprobada", false], ["fecha_implementacion", "fecha de implementación", true], ["fecha_verif_implementacion", "fecha verificación de implementación", true],
+          ["fecha_vigencia", "fecha verificación de vigencia (6 meses)", true], ["vigencia", "sigue vigente", false], ["estado", "estado Q.25", false],
+          ["necesidad", "necesidad / problema", false], ["impacto", "impacto esperado", false], ["meta", "indicador / meta", false], ["plan", "plan de implementación", false],
+          ["evidencia_implementacion", "evidencia de implementación", false], ["evidencia_vigencia", "evidencia de vigencia", false],
+        ];
+        for (const [col, campo, esFecha] of seguimiento) {
+          const ant = prev ? (esFecha ? d10(prev[col]) : prev[col]) : null, nue = esFecha ? d10(row[col]) : row[col];
+          if ((ant || null) !== (nue || null)) await logHist(sql, numero, "OM · " + campo, ant, nue, usuario, esFecha ? nue : null, motivo);
+        }
+        const cierreAnt = prev ? d10(prev.cerrada_en) : null;
+        if ((cierreAnt || null) !== (d10(row.cerrada_en) || null)) await logHist(sql, numero, "OM · cierre", cierreAnt ? "Cerrada" : "Abierta", row.cerrada_en ? row.motivo_cierre : "Reabierta", usuario, d10(row.cerrada_en), motivo);
+        return json(row);
       }
 
       // PUT /api/om/:numero -> crea o actualiza la fila Q.25 de esa OM
