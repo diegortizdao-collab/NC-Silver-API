@@ -126,6 +126,29 @@ function json(data, status = 200) {
   });
 }
 
+
+// ---- Gestión de NC: helpers ----
+function hoyAR() { return new Date(Date.now() - 3 * 3600 * 1000).toISOString().slice(0, 10); }
+async function logHist(sql, numero, campo, ant, nuevo, usuario, fechaHecho, motivo) {
+  await sql`INSERT INTO nc_historial (nc_numero, campo, valor_anterior, valor_nuevo, usuario, fecha_hecho, motivo)
+            VALUES (${numero}, ${campo}, ${ant == null ? null : String(ant).slice(0, 300)}, ${nuevo == null ? null : String(nuevo).slice(0, 300)}, ${usuario || null}, ${fechaHecho || null}, ${motivo || null})`;
+}
+// Si alguna fecha del hecho es anterior a hoy, el registro es posterior al hecho: se deja constancia automática.
+function motivoAuto(fechasHecho, hoy) {
+  return fechasHecho.some((f) => f && String(f).slice(0, 10) < hoy) ? "Registro posterior a la fecha del hecho" : null;
+}
+// Condiciones para pasar una NC a "Cerrada". Devuelve el texto del error o null.
+function errorCierre(nc, an) {
+  if (!nc.requiere_accion) return "Para cerrar, indicá si la NC requiere acción correctiva (Sí / No).";
+  if (nc.cumplido !== "Sí" || !nc.fecha_cumplimiento) return "Para cerrar, la acción inmediata tiene que estar cumplida, con su fecha.";
+  if (nc.requiere_accion === "Sí") {
+    if (!an || !an.causa_raiz) return "Para cerrar una NC con acción correctiva falta la causa raíz (análisis de los 5 porqués).";
+    if (!an.fecha_verif_cumplimiento || !an.evidencia_cumplimiento) return "Falta la verificación de cumplimiento de la acción (fecha y evidencia).";
+    if (!an.fecha_verif_eficacia || !an.evidencia_eficacia) return "Falta la verificación de eficacia (fecha y evidencia).";
+  }
+  return null;
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
@@ -317,7 +340,8 @@ export default {
         if (!nc) return json({ error: "NC no encontrada" }, 404);
         const [analisis] = await sql`SELECT * FROM nc_analisis WHERE nc_numero = ${numero}`;
         const notificaciones = await sql`SELECT * FROM nc_notificaciones WHERE nc_numero = ${numero}`;
-        return json({ ...nc, analisis: analisis || null, notificaciones });
+        const historial = await sql`SELECT id, campo, valor_anterior, valor_nuevo, usuario, fecha, fecha_hecho, motivo FROM nc_historial WHERE nc_numero = ${numero} ORDER BY fecha DESC, id DESC`;
+        return json({ ...nc, analisis: analisis || null, notificaciones, historial });
       }
 
       // POST /api/nc -> crea una NC nueva (Bloque 1)
@@ -395,13 +419,54 @@ export default {
         return json(row);
       }
 
+      // PUT /api/nc/:numero/gestion -> gestión del estado de una NC desde el Q.21.
+      // Cuerpo: {requiereAccion?: "Sí"|"No", cumplido?: "Sí"|"No", fechaCumplimiento?, estado?, motivo?}
+      // La fecha del hecho la carga el usuario (no puede ser futura); la fecha de registro la pone el servidor.
+      if (request.method === "PUT" && parts[1] === "nc" && parts[2] && parts[3] === "gestion") {
+        const numero = Number(parts[2]);
+        const b = await request.json();
+        const [nc] = await sql`SELECT * FROM nc WHERE numero = ${numero}`;
+        if (!nc) return json({ error: "NC no encontrada" }, 404);
+        if (nc.documento_congelado) return json({ error: "La NC está cerrada: su documento está congelado y no se puede modificar." }, 409);
+        const [an] = await sql`SELECT * FROM nc_analisis WHERE nc_numero = ${numero}`;
+        const hoy = hoyAR();
+        const d10 = (v) => (v ? String(v).slice(0, 10) : null);
+        const requiere = b.requiereAccion !== undefined ? b.requiereAccion : nc.requiere_accion;
+        const cumplido = b.cumplido !== undefined ? b.cumplido : nc.cumplido;
+        const fechaCump = cumplido === "Sí" ? (b.fechaCumplimiento !== undefined ? d10(b.fechaCumplimiento) : d10(nc.fecha_cumplimiento)) : null;
+        const estadoNuevo = b.estado || (an && an.estado) || "Abierta";
+        if (requiere && !["Sí", "No"].includes(requiere)) return json({ error: "«Requiere acción correctiva» debe ser Sí o No" }, 400);
+        if (cumplido && !["Sí", "No"].includes(cumplido)) return json({ error: "«Cumplido» debe ser Sí o No" }, 400);
+        if (fechaCump && (!/^\d{4}-\d{2}-\d{2}$/.test(fechaCump) || fechaCump > hoy)) return json({ error: "La fecha de cumplimiento es inválida o futura: tiene que ser la fecha real en que se cumplió." }, 400);
+        if (cumplido === "Sí" && !fechaCump) return json({ error: "Cargá la fecha en que se cumplió la acción inmediata." }, 400);
+        if (estadoNuevo === "Cerrada" && !(an && an.estado === "Cerrada")) {
+          const err = errorCierre({ ...nc, requiere_accion: requiere, cumplido, fecha_cumplimiento: fechaCump }, an);
+          if (err) return json({ error: err }, 400);
+        }
+        const motivo = b.motivo || motivoAuto([fechaCump], hoy);
+        const usuario = b.usuario || usuarioToken;
+        await sql`UPDATE nc SET requiere_accion = ${requiere || null}, cumplido = ${cumplido || null}, fecha_cumplimiento = ${fechaCump}, actualizado_en = now() WHERE numero = ${numero}`;
+        if ((nc.requiere_accion || null) !== (requiere || null)) await logHist(sql, numero, "requiere acción correctiva", nc.requiere_accion || "—", requiere || "—", usuario, null, motivo);
+        if ((nc.cumplido || null) !== (cumplido || null) || d10(nc.fecha_cumplimiento) !== fechaCump)
+          await logHist(sql, numero, "acción cumplida", (nc.cumplido || "—") + (nc.fecha_cumplimiento ? " (" + d10(nc.fecha_cumplimiento) + ")" : ""), (cumplido || "—") + (fechaCump ? " (" + fechaCump + ")" : ""), usuario, fechaCump, motivo);
+        if (!an) {
+          await sql`INSERT INTO nc_analisis (nc_numero, estado, no_requiere_notificacion, actualizado_en) VALUES (${numero}, ${estadoNuevo}, ${requiere === "No"}, now())`;
+          await logHist(sql, numero, "estado", null, estadoNuevo, usuario, null, motivo);
+        } else if (an.estado !== estadoNuevo) {
+          await sql`UPDATE nc_analisis SET estado = ${estadoNuevo}, actualizado_en = now() WHERE nc_numero = ${numero}`;
+          await logHist(sql, numero, "estado", an.estado, estadoNuevo, usuario, estadoNuevo === "Cerrada" ? hoy : null, motivo);
+        }
+        const [fila] = await sql`SELECT * FROM nc WHERE numero = ${numero}`;
+        return json({ ...fila, estado: estadoNuevo });
+      }
+
       // PUT /api/nc/:numero/cumplimiento {cumplido: "Sí"|"No", fechaCumplimiento} -> marca la disposición / acción inmediata como cumplida
       if (request.method === "PUT" && parts[1] === "nc" && parts[2] && parts[3] === "cumplimiento") {
         const numero = Number(parts[2]);
         const b = await request.json();
         if (!["Sí", "No"].includes(b.cumplido)) return json({ error: "Indicá si la acción fue cumplida (Sí / No)" }, 400);
         const fecha = b.cumplido === "Sí" ? (String(b.fechaCumplimiento || "").slice(0, 10) || null) : null;
-        if (fecha && !/^\d{4}-\d{2}-\d{2}$/.test(fecha)) return json({ error: "Fecha de cumplimiento inválida" }, 400);
+        if (fecha && (!/^\d{4}-\d{2}-\d{2}$/.test(fecha) || fecha > hoyAR())) return json({ error: "Fecha de cumplimiento inválida o futura: tiene que ser la fecha real del hecho" }, 400);
         const [previo] = await sql`SELECT cumplido, fecha_cumplimiento, documento_congelado FROM nc WHERE numero = ${numero}`;
         if (!previo) return json({ error: "NC no encontrada" }, 404);
         if (previo.documento_congelado) return json({ error: "La NC está cerrada: su documento está congelado y no se puede modificar." }, 409);
@@ -410,11 +475,11 @@ export default {
           WHERE numero = ${numero} RETURNING *
         `;
         await sql`
-          INSERT INTO nc_historial (nc_numero, campo, valor_anterior, valor_nuevo, usuario)
+          INSERT INTO nc_historial (nc_numero, campo, valor_anterior, valor_nuevo, usuario, fecha_hecho, motivo)
           VALUES (${numero}, 'acción cumplida',
                   ${(previo.cumplido || "—") + (previo.fecha_cumplimiento ? " (" + String(previo.fecha_cumplimiento).slice(0, 10) + ")" : "")},
                   ${b.cumplido + (fecha ? " (" + fecha + ")" : "")},
-                  ${b.usuario || usuarioToken})
+                  ${b.usuario || usuarioToken}, ${fecha}, ${b.motivo || motivoAuto([fecha], hoyAR())})
         `;
         return json(row);
       }
@@ -424,7 +489,19 @@ export default {
         const numero = Number(parts[2]);
         const b = await request.json();
 
-        const [previo] = await sql`SELECT estado FROM nc_analisis WHERE nc_numero = ${numero}`;
+        const [previo] = await sql`SELECT * FROM nc_analisis WHERE nc_numero = ${numero}`;
+        const hoy = hoyAR();
+        for (const [k, rot] of [["fechaVerifCumplimiento", "verificación de cumplimiento"], ["fechaVerifEficacia", "verificación de eficacia"]]) {
+          if (b[k] && (!/^\d{4}-\d{2}-\d{2}/.test(b[k]) || String(b[k]).slice(0, 10) > hoy)) return json({ error: `La fecha de ${rot} es inválida o futura: tiene que ser la fecha real del hecho.` }, 400);
+        }
+        const [ncPrev] = await sql`SELECT * FROM nc WHERE numero = ${numero}`;
+        if (b.estado === "Cerrada" && !(previo && previo.estado === "Cerrada") && ncPrev) {
+          const err = errorCierre(ncPrev, {
+            causa_raiz: b.causaRaiz, fecha_verif_cumplimiento: b.fechaVerifCumplimiento, evidencia_cumplimiento: b.evidenciaCumplimiento,
+            fecha_verif_eficacia: b.fechaVerifEficacia, evidencia_eficacia: b.evidenciaEficacia,
+          });
+          if (err) return json({ error: err }, 400);
+        }
 
         const [row] = await sql`
           INSERT INTO nc_analisis (
@@ -457,11 +534,18 @@ export default {
           RETURNING *
         `;
 
-        if (!previo || previo.estado !== row.estado) {
-          await sql`
-            INSERT INTO nc_historial (nc_numero, campo, valor_anterior, valor_nuevo, usuario)
-            VALUES (${numero}, 'estado', ${previo ? previo.estado : null}, ${row.estado}, ${b.usuario || null})
-          `;
+        const usuarioH = b.usuario || usuarioToken;
+        const d10a = (v) => (v ? String(v).slice(0, 10) : null);
+        const motivoA = b.motivo || motivoAuto([d10a(row.fecha_verif_cumplimiento) !== d10a(previo && previo.fecha_verif_cumplimiento) ? row.fecha_verif_cumplimiento : null, d10a(row.fecha_verif_eficacia) !== d10a(previo && previo.fecha_verif_eficacia) ? row.fecha_verif_eficacia : null], hoy);
+        if (!previo || previo.estado !== row.estado) await logHist(sql, numero, "estado", previo ? previo.estado : null, row.estado, usuarioH, row.estado === "Cerrada" ? hoy : null, motivoA);
+        for (const [campo, col, esFecha] of [
+          ["fecha programada de la acción", "fecha_programada_accion", true], ["fecha verificación de cumplimiento", "fecha_verif_cumplimiento", true],
+          ["fecha verificación de eficacia", "fecha_verif_eficacia", true], ["causa raíz", "causa_raiz", false],
+          ["acción correctiva definida", "accion_descripcion", false], ["evidencia de cumplimiento", "evidencia_cumplimiento", false], ["evidencia de eficacia", "evidencia_eficacia", false],
+        ]) {
+          const ant = esFecha ? d10a(previo && previo[col]) : (previo && previo[col]) || null;
+          const nue = esFecha ? d10a(row[col]) : row[col] || null;
+          if ((ant || null) !== (nue || null)) await logHist(sql, numero, campo, ant, nue, usuarioH, esFecha && col !== "fecha_programada_accion" ? nue : null, motivoA);
         }
 
         return json(row);
