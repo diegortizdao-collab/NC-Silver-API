@@ -268,16 +268,27 @@ export default {
         }
         const [ncRow] = await sql`SELECT documento_congelado FROM nc WHERE numero = ${numero}`;
         if (!ncRow) return json({ error: "NC no encontrada" }, 404);
-        if (ncRow.documento_congelado) {
+        // Gestión de Calidad puede reemplazar el Word aun congelado (?forzar=1): edición manual con constancia en el historial.
+        const forzar = url.searchParams.get("forzar") === "1" && MAILS_FIRMAS.has(usuarioToken);
+        if (ncRow.documento_congelado && !forzar) {
           return json({ error: "El documento de esta NC ya está congelado (cerrada) y no se puede sobrescribir." }, 409);
         }
         const bytes = await request.arrayBuffer();
+        if (forzar) {
+          const u8 = new Uint8Array(bytes.slice(0, 2));
+          if (u8[0] !== 0x50 || u8[1] !== 0x4b || bytes.byteLength > 15 * 1024 * 1024) return json({ error: "El archivo no es un .docx válido (o supera 15 MB)." }, 400);
+        }
         const key = `nc/Q21_NC_${numero}.docx`;
         await env.NC_DOCS.put(key, bytes, {
           httpMetadata: {
             contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
           },
         });
+        if (forzar) {
+          await sql`UPDATE nc SET documento_generado_en = now() WHERE numero = ${numero}`;
+          await logHist(sql, numero, "documento Q.21", null, "Word reemplazado manualmente" + (ncRow.documento_congelado ? " (documento congelado)" : ""), usuarioToken, null, url.searchParams.get("motivo") || "Edición manual del Word por Gestión de Calidad");
+          return json({ ok: true, congelado: !!ncRow.documento_congelado });
+        }
         const congelar = url.searchParams.get("congelar") === "1";
         await sql`
           UPDATE nc SET documento_generado_en = now(), documento_congelado = ${congelar}
