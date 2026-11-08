@@ -472,6 +472,50 @@ export default {
         return json({ ...fila, estado: estadoNuevo });
       }
 
+      // PUT /api/nc/:numero/datos -> completa/corrige los datos del Bloque 1 de una NC existente (p. ej. migradas del histórico).
+      // Cada campo que cambia queda en el historial. Bloqueado si el documento está congelado.
+      if (request.method === "PUT" && parts[1] === "nc" && parts[2] && parts[3] === "datos") {
+        const numero = Number(parts[2]);
+        const b = await request.json();
+        const [nc] = await sql`SELECT * FROM nc WHERE numero = ${numero}`;
+        if (!nc) return json({ error: "NC no encontrada" }, 404);
+        if (nc.documento_congelado) return json({ error: "La NC está cerrada: su documento está congelado y no se puede modificar." }, 409);
+        const txtv = (v, max = 4000) => (v == null || String(v).trim() === "" ? null : String(v).trim().slice(0, max));
+        const nuevo = {
+          cliente: b.cliente !== undefined ? txtv(b.cliente, 200) : nc.cliente,
+          producto: b.producto !== undefined ? txtv(b.producto, 300) : nc.producto,
+          descripcion: b.descripcion !== undefined ? txtv(b.descripcion) : nc.descripcion,
+          operario: b.operario !== undefined ? txtv(b.operario, 200) : nc.operario,
+          maquina: b.maquina !== undefined ? txtv(b.maquina, 100) : nc.maquina,
+          oti: b.oti !== undefined ? txtv(b.oti, 100) : nc.oti,
+          cantidad_piezas: b.cantidadPiezas !== undefined ? txtv(b.cantidadPiezas, 100) : nc.cantidad_piezas,
+          disposicion: b.disposicion !== undefined ? txtv(b.disposicion) : nc.disposicion,
+        };
+        const fp = b.fechaProduccion !== undefined ? fechaSQL(b.fechaProduccion) : d10(nc.fecha_produccion);
+        const fprog = b.fechaProgramada !== undefined ? fechaSQL(b.fechaProgramada) : d10(nc.fecha_programada);
+        if (fp === undefined || fprog === undefined) return json({ error: "Una de las fechas no tiene un formato válido." }, 400);
+        if (fp && fp > hoyAR()) return json({ error: "La fecha del hecho no puede ser futura." }, 400);
+        const PERS = { Ortigoza: "Ramón", Canaberro: "Mariano", Ortiz: "Diego" };
+        let cpAp = nc.cargado_por_apellido, cpNo = nc.cargado_por_nombre;
+        if (b.cargadoPor !== undefined) {
+          if (b.cargadoPor && !PERS[b.cargadoPor]) return json({ error: "«Cargada por» debe ser Ortigoza, Canaberro u Ortiz." }, 400);
+          cpAp = b.cargadoPor || null; cpNo = b.cargadoPor ? PERS[b.cargadoPor] : null;
+        }
+        if (!nuevo.producto || !nuevo.descripcion) return json({ error: "Producto y descripción son obligatorios." }, 400);
+        await sql`UPDATE nc SET cliente = ${nuevo.cliente}, producto = ${nuevo.producto}, descripcion = ${nuevo.descripcion}, operario = ${nuevo.operario},
+                  maquina = ${nuevo.maquina}, oti = ${nuevo.oti}, cantidad_piezas = ${nuevo.cantidad_piezas}, disposicion = ${nuevo.disposicion},
+                  fecha_produccion = ${fp}, fecha_programada = ${fprog}, cargado_por_apellido = ${cpAp}, cargado_por_nombre = ${cpNo}, actualizado_en = now()
+                  WHERE numero = ${numero}`;
+        const usuario = b.usuario || usuarioToken, motivo = b.motivo || "Completado de datos del registro";
+        const cambios = [["cliente", nc.cliente, nuevo.cliente], ["producto", nc.producto, nuevo.producto], ["descripción", nc.descripcion, nuevo.descripcion],
+          ["operario", nc.operario, nuevo.operario], ["máquina", nc.maquina, nuevo.maquina], ["OTI", nc.oti, nuevo.oti], ["cantidad de piezas", nc.cantidad_piezas, nuevo.cantidad_piezas],
+          ["disposición / acción inmediata", nc.disposicion, nuevo.disposicion], ["fecha del hecho", d10(nc.fecha_produccion), fp], ["fecha programada", d10(nc.fecha_programada), fprog],
+          ["cargada por", nc.cargado_por_apellido, cpAp]];
+        for (const [campo, ant, nue] of cambios) if ((ant || null) !== (nue || null)) await logHist(sql, numero, "dato: " + campo, ant, nue, usuario, null, motivo);
+        const [fila] = await sql`SELECT * FROM nc WHERE numero = ${numero}`;
+        return json(fila);
+      }
+
       // PUT /api/nc/:numero/cumplimiento {cumplido: "Sí"|"No", fechaCumplimiento} -> marca la disposición / acción inmediata como cumplida
       if (request.method === "PUT" && parts[1] === "nc" && parts[2] && parts[3] === "cumplimiento") {
         const numero = Number(parts[2]);
