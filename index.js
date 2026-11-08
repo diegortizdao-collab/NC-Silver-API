@@ -128,6 +128,16 @@ function json(data, status = 200) {
 
 
 // ---- Gestión de NC: helpers ----
+// Normaliza una fecha recibida (ISO o texto con año) a YYYY-MM-DD; null si vacía; undefined si no se entiende
+function fechaSQL(v) {
+  if (v == null || String(v).trim() === "") return null;
+  const t = String(v).trim();
+  const m = t.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  if (!/\d{4}/.test(t)) return undefined;
+  const d = new Date(t);
+  return isNaN(d) ? undefined : d.toISOString().slice(0, 10);
+}
 function hoyAR() { return new Date(Date.now() - 3 * 3600 * 1000).toISOString().slice(0, 10); }
 async function logHist(sql, numero, campo, ant, nuevo, usuario, fechaHecho, motivo) {
   await sql`INSERT INTO nc_historial (nc_numero, campo, valor_anterior, valor_nuevo, usuario, fecha_hecho, motivo)
@@ -489,6 +499,11 @@ export default {
       if (request.method === "PUT" && parts[1] === "nc" && parts[2] && parts[3] === "analisis") {
         const numero = Number(parts[2]);
         const b = await request.json();
+        for (const [k, rot] of [["fechaProgramadaAccion", "programada de la acción"], ["fechaVerifCumplimiento", "de verificación de cumplimiento"], ["fechaVerifEficacia", "de verificación de eficacia"]]) {
+          const n = fechaSQL(b[k]);
+          if (n === undefined) return json({ error: `La fecha ${rot} no tiene un formato válido (${String(b[k]).slice(0, 30)}). Volvé a elegirla en el calendario.` }, 400);
+          b[k] = n;
+        }
 
         const [previo] = await sql`SELECT * FROM nc_analisis WHERE nc_numero = ${numero}`;
         const hoy = hoyAR();
