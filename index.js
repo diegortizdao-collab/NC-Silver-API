@@ -211,8 +211,8 @@ export default {
     if (!usuarioToken) return json({ error: "No autorizado" }, 401);
 
     // Cuentas de Reclamos (nombre + clave): solo /api/reclamos/*
-    if (usuarioToken.startsWith("rec:") && !(parts[0] === "api" && parts[1] === "reclamos")) {
-      return json({ error: "Acceso restringido: esta cuenta solo accede a Reclamos" }, 403);
+    if (usuarioToken.startsWith("rec:") && !(parts[0] === "api" && (parts[1] === "reclamos" || parts[1] === "proveedores"))) {
+      return json({ error: "Acceso restringido: esta cuenta solo accede a Reclamos y Proveedores" }, 403);
     }
 
     // Cuentas de RRHH: solo pueden guardar ausentismo (y nada más).
@@ -655,6 +655,85 @@ export default {
           RETURNING *
         `;
         return json(row, 201);
+      }
+
+      // ---------------------------------------------------------------------------
+      // Proveedores (A.08 listado + A.25 evaluación anual). Ver db_006_proveedores.sql
+      //  GET /api/proveedores -> {proveedores, evaluaciones} | POST /api/proveedores (alta rápida)
+      //  PUT /api/proveedores/:id | PUT /api/proveedores/:id/evaluacion {anio, ...}
+      // Ver: cualquier cuenta con acceso. Alta/edición/evaluación: solo quien "edita" (Diego Ortiz).
+      // Clases (I.01): A, B, C, D o "Sin evaluar".
+      // ---------------------------------------------------------------------------
+      if (parts[1] === "proveedores") {
+        const esRec = usuarioToken.startsWith("rec:");
+        const quien = esRec ? usuarioToken.slice(4) : usuarioToken;
+        const edita = esRec ? !!RECLAMOS_USUARIOS[normNombre(quien)]?.edita : EDITORES_RECLAMOS_MAIL.has(usuarioToken);
+        const sinPermiso = () => json({ error: "Solo Diego Ortiz puede dar de alta o modificar proveedores" }, 403);
+        const txt = (v, max = 2000) => (v == null || String(v).trim() === "" ? null : String(v).trim().slice(0, max));
+        const fechaOk = (v) => (v == null || v === "" ? null : /^\d{4}-\d{2}-\d{2}$/.test(String(v)) && !isNaN(Date.parse(v)) ? String(v) : false);
+        const cnt = (v) => (v == null || v === "" ? null : Number.isInteger(Number(v)) && Number(v) >= 0 && Number(v) < 1000 ? Number(v) : false);
+        const CLASES = ["A", "B", "C", "D", "Sin evaluar"];
+        if (request.method === "GET" && !parts[2]) {
+          const proveedores = await sql`SELECT id, nombre, tipo, critico, estado, fecha_ingreso::text AS fecha_ingreso, observaciones, creado_por FROM prov_proveedores ORDER BY nombre`;
+          const evaluaciones = await sql`SELECT proveedor_id, anio, fecha::text AS fecha, no_certificado, fuera_fecha, malas_condiciones, clase, observaciones FROM prov_evaluaciones ORDER BY anio DESC`;
+          return json({ proveedores, evaluaciones, edita });
+        }
+        if (!edita) return sinPermiso();
+        if (request.method === "POST" && !parts[2]) {
+          const b = await request.json().catch(() => ({}));
+          const nombre = txt(b.nombre, 200);
+          if (!nombre) return json({ error: "Falta el nombre del proveedor" }, 400);
+          const fi = fechaOk(b.fecha_ingreso);
+          if (fi === false) return json({ error: "Fecha de ingreso inválida" }, 400);
+          const estado = ["aprobado", "provisorio", "discontinuado"].includes(b.estado) ? b.estado : "provisorio";
+          const [dup] = await sql`SELECT id FROM prov_proveedores WHERE lower(nombre) = lower(${nombre})`;
+          if (dup) return json({ error: `Ya existe el proveedor "${nombre}"` }, 409);
+          const [row] = await sql`
+            INSERT INTO prov_proveedores (nombre, tipo, critico, estado, fecha_ingreso, observaciones, creado_por)
+            VALUES (${nombre}, ${b.tipo === "Servicio" ? "Servicio" : "Material"}, ${b.critico === false ? false : true}, ${estado}, ${fi || hoyAR()}, ${txt(b.observaciones)}, ${quien})
+            RETURNING id, nombre, tipo, critico, estado, fecha_ingreso::text AS fecha_ingreso, observaciones`;
+          return json(row, 201);
+        }
+        const id = Number(parts[2]);
+        if (!Number.isInteger(id)) return json({ error: "Proveedor inválido" }, 400);
+        const [prov] = await sql`SELECT id FROM prov_proveedores WHERE id = ${id}`;
+        if (!prov) return json({ error: "Proveedor no encontrado" }, 404);
+        if (request.method === "PUT" && !parts[3]) {
+          const b = await request.json().catch(() => ({}));
+          const fi = "fecha_ingreso" in b ? fechaOk(b.fecha_ingreso) : undefined;
+          if (fi === false) return json({ error: "Fecha de ingreso inválida" }, 400);
+          if ("estado" in b && !["aprobado", "provisorio", "discontinuado"].includes(b.estado)) return json({ error: "Estado inválido" }, 400);
+          const [row] = await sql`
+            UPDATE prov_proveedores SET
+              nombre = COALESCE(${"nombre" in b ? txt(b.nombre, 200) : null}, nombre),
+              tipo = COALESCE(${b.tipo === "Servicio" || b.tipo === "Material" ? b.tipo : null}, tipo),
+              critico = COALESCE(${typeof b.critico === "boolean" ? b.critico : null}, critico),
+              estado = COALESCE(${b.estado || null}, estado),
+              fecha_ingreso = COALESCE(${fi || null}::date, fecha_ingreso),
+              observaciones = COALESCE(${txt(b.observaciones)}, observaciones),
+              actualizado_en = now()
+            WHERE id = ${id}
+            RETURNING id, nombre, tipo, critico, estado, fecha_ingreso::text AS fecha_ingreso, observaciones`;
+          return json(row);
+        }
+        if (request.method === "PUT" && parts[3] === "evaluacion") {
+          const b = await request.json().catch(() => ({}));
+          const anio = Number(b.anio);
+          if (!Number.isInteger(anio) || anio < 2000 || anio > 2100) return json({ error: "Año inválido" }, 400);
+          const f = fechaOk(b.fecha);
+          const c1 = cnt(b.no_certificado), c2 = cnt(b.fuera_fecha), c3 = cnt(b.malas_condiciones);
+          if (f === false || c1 === false || c2 === false || c3 === false) return json({ error: "Fecha o cantidades inválidas" }, 400);
+          if (!CLASES.includes(b.clase)) return json({ error: "Clase inválida (A, B, C, D o Sin evaluar)" }, 400);
+          const [row] = await sql`
+            INSERT INTO prov_evaluaciones (proveedor_id, anio, fecha, no_certificado, fuera_fecha, malas_condiciones, clase, observaciones, actualizado_por)
+            VALUES (${id}, ${anio}, ${f || hoyAR()}, ${c1}, ${c2}, ${c3}, ${b.clase}, ${txt(b.observaciones)}, ${quien})
+            ON CONFLICT (proveedor_id, anio) DO UPDATE SET fecha = EXCLUDED.fecha, no_certificado = EXCLUDED.no_certificado,
+              fuera_fecha = EXCLUDED.fuera_fecha, malas_condiciones = EXCLUDED.malas_condiciones, clase = EXCLUDED.clase,
+              observaciones = EXCLUDED.observaciones, actualizado_por = EXCLUDED.actualizado_por, actualizado_en = now()
+            RETURNING proveedor_id, anio, fecha::text AS fecha, no_certificado, fuera_fecha, malas_condiciones, clase, observaciones`;
+          return json(row);
+        }
+        return json({ error: "Método no permitido" }, 405);
       }
 
       // ---------------------------------------------------------------------------
